@@ -155,7 +155,14 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
                     activeDeletion = rt.deletionTime();
 
                 if (row == null)
-                    return activeDeletion.isLive() ? null : BTreeRow.emptyDeletedRow(clustering, Row.Deletion.regular(activeDeletion));
+                {
+                    // this means our partition level deletion superseedes all other deletions and we don't have to keep the row deletions
+                    if (activeDeletion == partitionDeletion)
+                        return null;
+                    // no need to check activeDeletion.isLive here - if anything superseedes the partitionDeletion
+                    // it must be non-live
+                    return BTreeRow.emptyDeletedRow(clustering, Row.Deletion.regular(activeDeletion));
+                }
 
                 return row.filter(columns, activeDeletion, true, metadata);
             }
@@ -266,10 +273,10 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
 
     protected static Holder build(UnfilteredRowIterator iterator, int initialRowCapacity)
     {
-        return build(iterator, initialRowCapacity, true);
+        return build(iterator, initialRowCapacity, true, null);
     }
 
-    protected static Holder build(UnfilteredRowIterator iterator, int initialRowCapacity, boolean ordered)
+    protected static Holder build(UnfilteredRowIterator iterator, int initialRowCapacity, boolean ordered, BTree.Builder.QuickResolver<Row> quickResolver)
     {
         CFMetaData metadata = iterator.metadata();
         PartitionColumns columns = iterator.columns();
@@ -277,6 +284,7 @@ public abstract class AbstractBTreePartition implements Partition, Iterable<Row>
 
         BTree.Builder<Row> builder = BTree.builder(metadata.comparator, initialRowCapacity);
         builder.auto(!ordered);
+        builder.setQuickResolver(quickResolver);
         MutableDeletionInfo.Builder deletionBuilder = MutableDeletionInfo.builder(iterator.partitionLevelDeletion(), metadata.comparator, reversed);
 
         while (iterator.hasNext())

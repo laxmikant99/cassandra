@@ -21,6 +21,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import javax.management.openmbean.OpenDataException;
@@ -116,6 +117,9 @@ public class CompactionManager implements CompactionManagerMBean
     private final CompactionMetrics metrics = new CompactionMetrics(executor, validationExecutor);
     @VisibleForTesting
     final Multiset<ColumnFamilyStore> compactingCF = ConcurrentHashMultiset.create();
+
+    // used to temporarily pause non-strategy managed compactions (like index summary redistribution)
+    private final AtomicInteger globalCompactionPauseCount = new AtomicInteger(0);
 
     private final RateLimiter compactionRateLimiter = RateLimiter.create(Double.MAX_VALUE);
 
@@ -288,6 +292,7 @@ public class CompactionManager implements CompactionManagerMBean
     @SuppressWarnings("resource")
     private AllSSTableOpStatus parallelAllSSTableOperation(final ColumnFamilyStore cfs, final OneSSTableOperation operation, int jobs, OperationType operationType) throws ExecutionException, InterruptedException
     {
+        logger.info("Starting {} for {}.{}", operationType, cfs.keyspace.getName(), cfs.getTableName());
         List<LifecycleTransaction> transactions = new ArrayList<>();
         List<Future<?>> futures = new ArrayList<>();
         try (LifecycleTransaction compacting = cfs.markAllCompacting(operationType))
@@ -329,6 +334,7 @@ public class CompactionManager implements CompactionManagerMBean
             }
             FBUtilities.waitOnFutures(futures);
             assert compacting.originals().isEmpty();
+            logger.info("Finished {} for {}.{} successfully", operationType, cfs.keyspace.getName(), cfs.getTableName());
             return AllSSTableOpStatus.SUCCESSFUL;
         }
         finally
@@ -344,7 +350,7 @@ public class CompactionManager implements CompactionManagerMBean
             }
             Throwable fail = Throwables.close(null, transactions);
             if (fail != null)
-                logger.error("Failed to cleanup lifecycle transactions", fail);
+                logger.error("Failed to cleanup lifecycle transactions ({} for {}.{})", operationType, cfs.keyspace.getName(), cfs.getTableName(), fail);
         }
     }
 
@@ -466,7 +472,25 @@ public class CompactionManager implements CompactionManagerMBean
             public Iterable<SSTableReader> filterSSTables(LifecycleTransaction transaction)
             {
                 List<SSTableReader> sortedSSTables = Lists.newArrayList(transaction.originals());
-                Collections.sort(sortedSSTables, SSTableReader.sizeComparator);
+                Iterator<SSTableReader> sstableIter = sortedSSTables.iterator();
+                int totalSSTables = 0;
+                int skippedSStables = 0;
+                while (sstableIter.hasNext())
+                {
+                    SSTableReader sstable = sstableIter.next();
+                    totalSSTables++;
+                    if (!needsCleanup(sstable, ranges))
+                    {
+                        logger.debug("Not cleaning up {} ([{}, {}]) - no tokens outside owned ranges {}",
+                                     sstable, sstable.first.getToken(), sstable.last.getToken(), ranges);
+                        sstableIter.remove();
+                        transaction.cancel(sstable);
+                        skippedSStables++;
+                    }
+                }
+                logger.info("Skipping cleanup for {}/{} sstables for {}.{} since they are fully contained in owned ranges ({})",
+                            skippedSStables, totalSSTables, cfStore.keyspace.getName(), cfStore.getTableName(), ranges);
+                sortedSSTables.sort(SSTableReader.sizeComparator);
                 return sortedSSTables;
             }
 
@@ -568,12 +592,12 @@ public class CompactionManager implements CompactionManagerMBean
                     return true;
 
                 int diskIndex = diskBoundaries.getDiskIndex(sstable);
-                File diskLocation = diskBoundaries.directories.get(diskIndex).location;
                 PartitionPosition diskLast = diskBoundaries.positions.get(diskIndex);
 
                 // the location we get from directoryIndex is based on the first key in the sstable
                 // now we need to make sure the last key is less than the boundary as well:
-                return sstable.descriptor.directory.getAbsolutePath().startsWith(diskLocation.getAbsolutePath()) && sstable.last.compareTo(diskLast) <= 0;
+                Directories.DataDirectory dataDirectory = cfs.getDirectories().getDataDirectoryForFile(sstable.descriptor);
+                return diskBoundaries.directories.get(diskIndex).equals(dataDirectory) && sstable.last.compareTo(diskLast) <= 0;
             }
 
             @Override
@@ -784,36 +808,39 @@ public class CompactionManager implements CompactionManagerMBean
 
     public void forceCompactionForTokenRange(ColumnFamilyStore cfStore, Collection<Range<Token>> ranges)
     {
-        final Collection<AbstractCompactionTask> tasks = cfStore.runWithCompactionsDisabled(() ->
-                   {
-                       Collection<SSTableReader> sstables = sstablesInBounds(cfStore, ranges);
-                       if (sstables == null || sstables.isEmpty())
-                       {
-                           logger.debug("No sstables found for the provided token range");
-                           return null;
-                       }
-                       return cfStore.getCompactionStrategyManager().getUserDefinedTasks(sstables, getDefaultGcBefore(cfStore, FBUtilities.nowInSeconds()));
-                   }, false, false);
+        Callable<Collection<AbstractCompactionTask>> taskCreator = () -> {
+            Collection<SSTableReader> sstables = sstablesInBounds(cfStore, ranges);
+            if (sstables == null || sstables.isEmpty())
+            {
+                logger.debug("No sstables found for the provided token range");
+                return null;
+            }
+            return cfStore.getCompactionStrategyManager().getUserDefinedTasks(sstables, getDefaultGcBefore(cfStore, FBUtilities.nowInSeconds()));
+        };
+
+        final Collection<AbstractCompactionTask> tasks = cfStore.runWithCompactionsDisabled(taskCreator, false, false);
 
         if (tasks == null)
             return;
 
         Runnable runnable = new WrappedRunnable()
         {
-            protected void runMayThrow()
+            protected void runMayThrow() throws Exception
             {
-                for (AbstractCompactionTask task : tasks)
-                    if (task != null)
-                        task.execute(metrics);
+                try
+                {
+                    for (AbstractCompactionTask task : tasks)
+                        if (task != null)
+                            task.execute(metrics);
+                }
+                finally
+                {
+                    FBUtilities.closeAll(tasks.stream().map(task -> task.transaction).collect(Collectors.toList()));
+                }
             }
         };
 
-        if (executor.isShutdown())
-        {
-            logger.info("Compaction executor has shut down, not submitting task");
-            return;
-        }
-        FBUtilities.waitOnFuture(executor.submit(runnable));
+        FBUtilities.waitOnFuture(executor.submitIfRunning(runnable, "force compaction for token range"));
     }
 
     private static Collection<SSTableReader> sstablesInBounds(ColumnFamilyStore cfs, Collection<Range<Token>> tokenRangeCollection)
@@ -915,7 +942,7 @@ public class CompactionManager implements CompactionManagerMBean
     {
         Runnable runnable = new WrappedRunnable()
         {
-            protected void runMayThrow()
+            protected void runMayThrow() throws Exception
             {
                 // look up the sstables now that we're on the compaction executor, so we don't try to re-compact
                 // something that was already being compacted earlier.
@@ -941,10 +968,17 @@ public class CompactionManager implements CompactionManagerMBean
                 else
                 {
                     List<AbstractCompactionTask> tasks = cfs.getCompactionStrategyManager().getUserDefinedTasks(sstables, gcBefore);
-                    for (AbstractCompactionTask task : tasks)
+                    try
                     {
-                        if (task != null)
-                            task.execute(metrics);
+                        for (AbstractCompactionTask task : tasks)
+                        {
+                            if (task != null)
+                                task.execute(metrics);
+                        }
+                    }
+                    finally
+                    {
+                        FBUtilities.closeAll(tasks.stream().map(task -> task.transaction).collect(Collectors.toList()));
                     }
                 }
             }
@@ -1109,11 +1143,7 @@ public class CompactionManager implements CompactionManagerMBean
         {
             txn.obsoleteOriginals();
             txn.finish();
-            return;
-        }
-        if (!needsCleanup(sstable, ranges))
-        {
-            logger.trace("Skipping {} for cleanup; all rows should be kept", sstable);
+            logger.info("SSTable {} ([{}, {}]) does not intersect the owned ranges ({}), dropping it", sstable, sstable.first.getToken(), sstable.last.getToken(), ranges);
             return;
         }
 
@@ -1399,11 +1429,18 @@ public class CompactionManager implements CompactionManagerMBean
             // Create Merkle trees suitable to hold estimated partitions for the given ranges.
             // We blindly assume that a partition is evenly distributed on all sstables for now.
             MerkleTrees tree = createMerkleTrees(sstables, validator.desc.ranges, cfs);
+            RateLimiter limiter = getRateLimiter();
             long start = System.nanoTime();
             try (AbstractCompactionStrategy.ScannerList scanners = cfs.getCompactionStrategyManager().getScanners(sstables, validator.desc.ranges);
                  ValidationCompactionController controller = new ValidationCompactionController(cfs, gcBefore);
                  CompactionIterator ci = new ValidationCompactionIterator(scanners.scanners, controller, nowInSec, metrics))
             {
+                double compressionRatio = scanners.getCompressionRatio();
+                if (compressionRatio == MetadataCollector.NO_COMPRESSION_RATIO)
+                    compressionRatio = 1.0;
+
+                long lastBytesScanned = 0;
+
                 // validate the CF as we iterate over it
                 validator.prepare(cfs, tree);
                 while (ci.hasNext())
@@ -1414,6 +1451,11 @@ public class CompactionManager implements CompactionManagerMBean
                     {
                         validator.add(partition);
                     }
+
+                    long bytesScanned = scanners.getTotalBytesScanned();
+                    compactionRateLimiterAcquire(limiter, bytesScanned, lastBytesScanned, compressionRatio);
+                    lastBytesScanned = bytesScanned;
+
                 }
                 validator.complete();
             }
@@ -2078,7 +2120,8 @@ public class CompactionManager implements CompactionManagerMBean
             if ((info.getTaskType() == OperationType.VALIDATION) && !interruptValidation)
                 continue;
 
-            if (Iterables.contains(columnFamilies, info.getCFMetaData()))
+            // cfmetadata is null for index summary redistributions which are 'global' - they involve all keyspaces/tables
+            if (info.getCFMetaData() == null || Iterables.contains(columnFamilies, info.getCFMetaData()))
                 compactionHolder.stop(); // signal compaction to stop
         }
     }
@@ -2103,5 +2146,27 @@ public class CompactionManager implements CompactionManagerMBean
             else
                 break;
         }
+    }
+
+    /**
+     * Return whether "global" compactions should be paused, used by ColumnFamilyStore#runWithCompactionsDisabled
+     *
+     * a global compaction is one that includes several/all tables, currently only IndexSummaryBuilder
+     */
+    public boolean isGlobalCompactionPaused()
+    {
+        return globalCompactionPauseCount.get() > 0;
+    }
+
+    public CompactionPauser pauseGlobalCompaction()
+    {
+        CompactionPauser pauser = globalCompactionPauseCount::decrementAndGet;
+        globalCompactionPauseCount.incrementAndGet();
+        return pauser;
+    }
+
+    public interface CompactionPauser extends AutoCloseable
+    {
+        public void close();
     }
 }

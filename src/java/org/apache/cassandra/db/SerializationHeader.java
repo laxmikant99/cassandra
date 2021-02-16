@@ -37,6 +37,7 @@ import org.apache.cassandra.io.sstable.metadata.IMetadataComponentSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.SearchIterator;
 
 public class SerializationHeader
 {
@@ -131,6 +132,18 @@ public class SerializationHeader
     public boolean hasStatic()
     {
         return !columns.statics.isEmpty();
+    }
+
+    public boolean hasAllColumns(Row row, boolean isStatic)
+    {
+        SearchIterator<ColumnDefinition, ColumnData> rowIter = row.searchIterator();
+        Iterable<ColumnDefinition> columns = isStatic ? columns().statics : columns().regulars;
+        for (ColumnDefinition column : columns)
+        {
+            if (rowIter.next(column) == null)
+                return false;
+        }
+        return true;
     }
 
     public boolean isForSSTable()
@@ -290,6 +303,18 @@ public class SerializationHeader
             this.stats = stats;
         }
 
+        /**
+         * <em>Only</em> exposed for {@link org.apache.cassandra.io.sstable.SSTableHeaderFix}.
+         */
+        public static Component buildComponentForTools(AbstractType<?> keyType,
+                                                       List<AbstractType<?>> clusteringTypes,
+                                                       Map<ByteBuffer, AbstractType<?>> staticColumns,
+                                                       Map<ByteBuffer, AbstractType<?>> regularColumns,
+                                                       EncodingStats stats)
+        {
+            return new Component(keyType, clusteringTypes, staticColumns, regularColumns, stats);
+        }
+
         public MetadataType getType()
         {
             return MetadataType.HEADER;
@@ -415,8 +440,8 @@ public class SerializationHeader
             Columns statics, regulars;
             if (selection == null)
             {
-                statics = hasStatic ? Columns.serializer.deserialize(in, metadata) : Columns.NONE;
-                regulars = Columns.serializer.deserialize(in, metadata);
+                statics = hasStatic ? Columns.serializer.deserializeStatics(in, metadata) : Columns.NONE;
+                regulars = Columns.serializer.deserializeRegulars(in, metadata);
             }
             else
             {

@@ -22,14 +22,24 @@ import java.io.OutputStream;
 import java.io.PrintStream;
 import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.Assert;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.utils.FBUtilities;
+
 
 public class SEPExecutorTest
 {
+    @BeforeClass
+    public static void beforeClass()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @Test
     public void shutdownTest() throws Throwable
     {
@@ -50,13 +60,13 @@ public class SEPExecutorTest
 
         for (int idx = 0; idx < 20; idx++)
         {
-            ExecutorService es = sharedPool.newExecutor(FBUtilities.getAvailableProcessors(), Integer.MAX_VALUE, "STAGE", run + MAGIC + idx);
+            ExecutorService es = sharedPool.newExecutor(FBUtilities.getAvailableProcessors(), "STAGE", run + MAGIC + idx);
             // Write to black hole
             es.execute(() -> nullPrintSteam.println("TEST" + es));
         }
 
         // shutdown does not guarantee that threads are actually dead once it exits, only that they will stop promptly afterwards
-        sharedPool.shutdown();
+        sharedPool.shutdownAndWait(1L, TimeUnit.MINUTES);
         for (Thread thread : Thread.getAllStackTraces().keySet())
         {
             if (thread.getName().contains(MAGIC))

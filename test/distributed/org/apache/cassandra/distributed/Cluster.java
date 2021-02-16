@@ -18,40 +18,59 @@
 
 package org.apache.cassandra.distributed;
 
-import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.util.List;
+import java.util.function.Consumer;
 
-import org.apache.cassandra.distributed.api.ICluster;
+import org.apache.cassandra.distributed.api.IInstanceConfig;
+import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.impl.AbstractCluster;
-import org.apache.cassandra.distributed.impl.IInvokableInstance;
-import org.apache.cassandra.distributed.impl.InstanceConfig;
-import org.apache.cassandra.distributed.impl.Versions;
+import org.apache.cassandra.distributed.shared.AbstractBuilder;
+import org.apache.cassandra.distributed.shared.Versions;
 
 /**
  * A simple cluster supporting only the 'current' Cassandra version, offering easy access to the convenience methods
  * of IInvokableInstance on each node.
  */
-public class Cluster extends AbstractCluster<IInvokableInstance> implements ICluster, AutoCloseable
+public class Cluster extends AbstractCluster<IInvokableInstance>
 {
-    private Cluster(File root, Versions.Version version, List<InstanceConfig> configs, ClassLoader sharedClassLoader)
+
+    private Cluster(Builder builder)
     {
-        super(root, version, configs, sharedClassLoader);
+        super(builder);
     }
 
-    protected IInvokableInstance newInstanceWrapper(Versions.Version version, InstanceConfig config)
+    protected IInvokableInstance newInstanceWrapper(int generation, Versions.Version version, IInstanceConfig config)
     {
-        return new Wrapper(version, config);
+        return new Wrapper(generation, version, config);
+    }
+
+    public static Builder build()
+    {
+        return new Builder();
+    }
+
+    public static Builder build(int nodeCount)
+    {
+        return build().withNodes(nodeCount);
+    }
+
+    public static Cluster create(int nodeCount, Consumer<IInstanceConfig> configUpdater) throws IOException
+    {
+        return build(nodeCount).withConfig(configUpdater).start();
     }
 
     public static Cluster create(int nodeCount) throws Throwable
     {
-        return create(nodeCount, Cluster::new);
+        return build(nodeCount).start();
     }
-    public static Cluster create(int nodeCount, File root)
+
+    public static final class Builder extends AbstractBuilder<IInvokableInstance, Cluster, Builder>
     {
-        return create(nodeCount, Versions.CURRENT, root, Cluster::new);
+        public Builder()
+        {
+            super(Cluster::new);
+            withVersion(CURRENT_VERSION);
+        }
     }
 }
 

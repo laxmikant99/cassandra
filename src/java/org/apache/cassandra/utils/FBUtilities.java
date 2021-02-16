@@ -41,6 +41,8 @@ import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.netty.util.concurrent.FastThreadLocal;
 import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.auth.IAuthorizer;
@@ -65,9 +67,6 @@ import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.AsyncOneResponse;
 
-import org.codehaus.jackson.JsonFactory;
-import org.codehaus.jackson.map.ObjectMapper;
-
 public class FBUtilities
 {
     private static final Logger logger = LoggerFactory.getLogger(FBUtilities.class);
@@ -86,6 +85,8 @@ public class FBUtilities
     private static volatile InetAddress localInetAddress;
     private static volatile InetAddress broadcastInetAddress;
     private static volatile InetAddress broadcastRpcAddress;
+
+    private static volatile String previousReleaseVersionString;
 
     public static int getAvailableProcessors()
     {
@@ -335,6 +336,16 @@ public class FBUtilities
         return triggerDir;
     }
 
+    public static void setPreviousReleaseVersionString(String previousReleaseVersionString)
+    {
+        FBUtilities.previousReleaseVersionString = previousReleaseVersionString;
+    }
+
+    public static String getPreviousReleaseVersionString()
+    {
+        return previousReleaseVersionString;
+    }
+
     public static String getReleaseVersionString()
     {
         try (InputStream in = FBUtilities.class.getClassLoader().getResourceAsStream("org/apache/cassandra/config/version.properties"))
@@ -436,9 +447,9 @@ public class FBUtilities
         }
     }
 
-    public static void waitOnFutures(List<AsyncOneResponse> results, long ms) throws TimeoutException
+    public static void waitOnFutures(List<AsyncOneResponse<?>> results, long ms) throws TimeoutException
     {
-        for (AsyncOneResponse result : results)
+        for (AsyncOneResponse<?> result : results)
             result.get(ms, TimeUnit.MILLISECONDS);
     }
 
@@ -906,7 +917,7 @@ public class FBUtilities
         updateWithByte(digest, val ? 0 : 1);
     }
 
-    public static void closeAll(List<? extends AutoCloseable> l) throws Exception
+    public static void closeAll(Collection<? extends AutoCloseable> l) throws Exception
     {
         Exception toThrow = null;
         for (AutoCloseable c : l)

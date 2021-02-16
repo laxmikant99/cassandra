@@ -141,6 +141,11 @@ public class ColumnDefinition extends ColumnSpecification implements Selectable,
         return new ColumnDefinition(cfm, name, type, NO_POSITION, Kind.STATIC);
     }
 
+    public static ColumnDefinition staticDef(String ksName, String cfName, String name, AbstractType<?> type)
+    {
+        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true), type, NO_POSITION, Kind.STATIC);
+    }
+
     public ColumnDefinition(CFMetaData cfm, ByteBuffer name, AbstractType<?> type, int position, Kind kind)
     {
         this(cfm.ksName,
@@ -199,6 +204,29 @@ public class ColumnDefinition extends ColumnSpecification implements Selectable,
                 return nameComparator.compare(path1.get(0), path2.get(0));
             }
         };
+    }
+
+    private static class Placeholder extends ColumnDefinition
+    {
+        Placeholder(CFMetaData table, ByteBuffer name, AbstractType<?> type, int position, Kind kind)
+        {
+            super(table, name, type, position, kind);
+        }
+
+        public boolean isPlaceholder()
+        {
+            return true;
+        }
+    }
+
+    public static ColumnDefinition placeholder(CFMetaData table, ByteBuffer name, boolean isStatic)
+    {
+        return new Placeholder(table, name, EmptyType.instance, NO_POSITION, isStatic ? Kind.STATIC : Kind.REGULAR);
+    }
+
+    public boolean isPlaceholder()
+    {
+        return false;
     }
 
     public ColumnDefinition copy()
@@ -594,7 +622,7 @@ public class ColumnDefinition extends ColumnSpecification implements Selectable,
 
             private ColumnDefinition find(ByteBuffer id, CFMetaData cfm)
             {
-                ColumnDefinition def = cfm.getColumnDefinition(id);
+                ColumnDefinition def = cfm.getColumnDefinitionForCQL(id);
                 if (def == null)
                     throw new InvalidRequestException(String.format("Undefined column name %s", toString()));
                 return def;
