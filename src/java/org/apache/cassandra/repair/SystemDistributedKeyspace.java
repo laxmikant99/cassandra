@@ -54,6 +54,17 @@ public final class SystemDistributedKeyspace
 
     public static final String NAME = "system_distributed";
 
+    /**
+     * Generation is used as a timestamp for automatic table creation on startup.
+     * If you make any changes to the tables below, make sure to increment the
+     * generation and document your change here.
+     *
+     * gen 0: original definition in 2.2
+     * gen 1: (pre-)add options column to parent_repair_history in 3.0, 3.11
+     * gen 2: (pre-)add coordinator_port and participants_v2 columns to repair_history in 3.0, 3.11, 4.0
+     */
+    public static final long GENERATION = 2;
+
     public static final String REPAIR_HISTORY = "repair_history";
 
     public static final String PARENT_REPAIR_HISTORY = "parent_repair_history";
@@ -69,7 +80,9 @@ public final class SystemDistributedKeyspace
                      + "range_begin text,"
                      + "range_end text,"
                      + "coordinator inet,"
+                     + "coordinator_port int,"
                      + "participants set<inet>,"
+                     + "participants_v2 set<text>,"
                      + "exception_message text,"
                      + "exception_stacktrace text,"
                      + "status text,"
@@ -90,6 +103,7 @@ public final class SystemDistributedKeyspace
                      + "exception_stacktrace text,"
                      + "requested_ranges set<text>,"
                      + "successful_ranges set<text>,"
+                     + "options map<text, text>,"
                      + "PRIMARY KEY (parent_id))");
 
     private static CFMetaData compile(String name, String description, String schema)

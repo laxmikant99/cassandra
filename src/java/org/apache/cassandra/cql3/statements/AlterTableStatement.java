@@ -30,9 +30,11 @@ import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.CollectionType;
+import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.EmptyType;
 import org.apache.cassandra.db.view.View;
 import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Indexes;
 import org.apache.cassandra.schema.TableParams;
@@ -110,7 +112,26 @@ public class AlterTableStatement extends SchemaAlteringStatement
         switch (oType)
         {
             case ALTER:
-                throw new InvalidRequestException("Altering of types is not allowed");
+                // We do not support altering of types and only allow this to for people who have already one
+                // through the upgrade of 2.x CQL-created SSTables with Thrift writes, affected by CASSANDRA-15778.
+                if (meta.isDense()
+                    && meta.compactValueColumn().equals(def)
+                    && meta.compactValueColumn().type instanceof EmptyType
+                    && validator != null)
+                {
+                    if (validator.getType() instanceof BytesType)
+                    {
+                        cfm = meta.copyWithNewCompactValueType(validator.getType());
+                        break;
+                    }
+
+                    throw new InvalidRequestException(String.format("Compact value type can only be changed to BytesType, but %s was given.",
+                                                                    validator.getType()));
+                }
+                else
+                {
+                    throw new InvalidRequestException("Altering of types is not allowed");
+                }
             case ADD:
                 assert columnName != null;
                 if (meta.isDense())
@@ -138,10 +159,6 @@ public class AlterTableStatement extends SchemaAlteringStatement
                     }
                 }
 
-                // Cannot re-add a dropped counter column. See #7831.
-                if (meta.isCounter() && meta.getDroppedColumns().containsKey(columnName.bytes))
-                    throw new InvalidRequestException(String.format("Cannot re-add previously dropped counter column %s", columnName));
-
                 AbstractType<?> type = validator.getType();
                 if (type.isCollection() && type.isMultiCell())
                 {
@@ -149,29 +166,45 @@ public class AlterTableStatement extends SchemaAlteringStatement
                         throw new InvalidRequestException("Cannot use non-frozen collections in COMPACT STORAGE tables");
                     if (cfm.isSuper())
                         throw new InvalidRequestException("Cannot use non-frozen collections with super column families");
-
-                    // If there used to be a non-frozen collection column with the same name (that has been dropped),
-                    // we could still have some data using the old type, and so we can't allow adding a collection
-                    // with the same name unless the types are compatible (see #6276).
-                    CFMetaData.DroppedColumn dropped = cfm.getDroppedColumns().get(columnName.bytes);
-                    if (dropped != null && dropped.type instanceof CollectionType
-                        && dropped.type.isMultiCell() && !type.isCompatibleWith(dropped.type))
-                    {
-                        String message =
-                            String.format("Cannot add a collection with the name %s because a collection with the same name"
-                                          + " and a different type (%s) has already been used in the past",
-                                          columnName,
-                                          dropped.type.asCQL3Type());
-                        throw new InvalidRequestException(message);
-                    }
                 }
 
-                cfm.addColumnDefinition(isStatic
-                                        ? ColumnDefinition.staticDef(cfm, columnName.bytes, type)
-                                        : ColumnDefinition.regularDef(cfm, columnName.bytes, type));
+                ColumnDefinition toAdd = isStatic
+                                       ? ColumnDefinition.staticDef(cfm, columnName.bytes, type)
+                                       : ColumnDefinition.regularDef(cfm, columnName.bytes, type);
 
-                // Adding a column to a table which has an include all view requires the column to be added to the view
-                // as well
+                CFMetaData.DroppedColumn droppedColumn = meta.getDroppedColumns().get(columnName.bytes);
+                if (null != droppedColumn)
+                {
+                    if (droppedColumn.kind != toAdd.kind)
+                    {
+                        String message =
+                            String.format("Cannot re-add previously dropped column '%s' of kind %s, incompatible with previous kind %s",
+                                          columnName,
+                                          toAdd.kind,
+                                          droppedColumn.kind == null ? "UNKNOWN" : droppedColumn.kind);
+                        throw new InvalidRequestException(message);
+                    }
+
+                    // After #8099, not safe to re-add columns of incompatible types - until *maybe* deser logic with dropped
+                    // columns is pushed deeper down the line. The latter would still be problematic in cases of schema races.
+                    if (!type.isValueCompatibleWith(droppedColumn.type))
+                    {
+                        String message =
+                            String.format("Cannot re-add previously dropped column '%s' of type %s, incompatible with previous type %s",
+                                          columnName,
+                                          type.asCQL3Type(),
+                                          droppedColumn.type.asCQL3Type());
+                        throw new InvalidRequestException(message);
+                    }
+
+                    // Cannot re-add a dropped counter column. See #7831.
+                    if (meta.isCounter())
+                        throw new InvalidRequestException(String.format("Cannot re-add previously dropped counter column %s", columnName));
+                }
+
+                cfm.addColumnDefinition(toAdd);
+
+                // Adding a column to a table which has an include all view requires the column to be added to the view as well
                 if (!isStatic)
                 {
                     for (ViewDefinition view : views)
@@ -244,6 +277,14 @@ public class AlterTableStatement extends SchemaAlteringStatement
             case DROP_COMPACT_STORAGE:
                 if (!meta.isCompactTable())
                     throw new InvalidRequestException("Cannot DROP COMPACT STORAGE on table without COMPACT STORAGE");
+
+                // TODO: Global check of the sstables to be added as part of CASSANDRA-15897.
+                // Currently this is only a local check of the SSTables versions
+                for (SSTableReader ssTableReader : Keyspace.open(keyspace()).getColumnFamilyStore(columnFamily()).getLiveSSTables())
+                {
+                    if (!ssTableReader.descriptor.version.isLatestVersion())
+                        throw new InvalidRequestException("Cannot DROP COMPACT STORAGE until all SSTables are upgraded, please run `nodetool upgradesstables` first.");
+                }
 
                 cfm = meta.asNonCompact();
                 break;

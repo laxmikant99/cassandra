@@ -26,7 +26,6 @@ import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
@@ -44,6 +43,7 @@ import com.datastax.driver.core.ResultSet;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.metrics.ClientMetrics;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.functions.FunctionName;
@@ -61,6 +61,7 @@ import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.transport.ConfiguredLimit;
 import org.apache.cassandra.transport.Event;
 import org.apache.cassandra.transport.Server;
 import org.apache.cassandra.transport.messages.ResultMessage;
@@ -87,6 +88,7 @@ public abstract class CQLTester
     private static org.apache.cassandra.transport.Server server;
     protected static final int nativePort;
     protected static final InetAddress nativeAddr;
+    protected static ConfiguredLimit protocolVersionLimit;
     private static final Map<Integer, Cluster> clusters = new HashMap<>();
     private static final Map<Integer, Session> sessions = new HashMap<>();
 
@@ -129,8 +131,6 @@ public abstract class CQLTester
             throw new RuntimeException(e);
         }
     }
-
-    public static ResultMessage lastSchemaChangeResult;
 
     private List<String> keyspaces = new ArrayList<>();
     private List<String> tables = new ArrayList<>();
@@ -329,11 +329,44 @@ public abstract class CQLTester
         if (server != null)
             return;
 
+        prepareNetwork();
+        initializeNetwork();
+    }
+
+    protected static void prepareNetwork()
+    {
         SystemKeyspace.finishStartup();
         StorageService.instance.initServer();
         SchemaLoader.startGossiper();
+    }
 
-        server = new Server.Builder().withHost(nativeAddr).withPort(nativePort).build();
+    protected static void reinitializeNetwork()
+    {
+        if (server != null && server.isRunning())
+        {
+            server.stop();
+            server = null;
+        }
+        List<CloseFuture> futures = new ArrayList<>();
+        for (Cluster cluster : clusters.values())
+            futures.add(cluster.closeAsync());
+        for (Session session : sessions.values())
+            futures.add(session.closeAsync());
+        FBUtilities.waitOnFutures(futures);
+        clusters.clear();
+        sessions.clear();
+
+        initializeNetwork();
+    }
+
+    private static void initializeNetwork()
+    {
+        protocolVersionLimit = ConfiguredLimit.newLimit();
+        server = new Server.Builder().withHost(nativeAddr)
+                                     .withPort(nativePort)
+                                     .withProtocolVersionLimit(protocolVersionLimit)
+                                     .build();
+        ClientMetrics.instance.init(Collections.singleton(server));
         server.start();
 
         for (int version : PROTOCOL_VERSIONS)
@@ -341,9 +374,12 @@ public abstract class CQLTester
             if (clusters.containsKey(version))
                 continue;
 
+            if (version > protocolVersionLimit.getMaxVersion())
+                continue;
+
             Cluster cluster = Cluster.builder()
                                      .addContactPoints(nativeAddr)
-                                     .withClusterName("Test Cluster")
+                                     .withClusterName("Test Cluster-v" + version)
                                      .withPort(nativePort)
                                      .withProtocolVersion(ProtocolVersion.fromInt(version))
                                      .build();
@@ -352,6 +388,14 @@ public abstract class CQLTester
 
             logger.info("Started Java Driver instance for protocol version {}", version);
         }
+    }
+
+    protected void updateMaxNegotiableProtocolVersion()
+    {
+        if (protocolVersionLimit == null)
+            throw new IllegalStateException("Native transport server has not been initialized");
+
+        protocolVersionLimit.updateMaxSupportedVersion();
     }
 
     protected void dropPerTestKeyspace() throws Throwable
@@ -426,16 +470,9 @@ public abstract class CQLTester
 
     public void compact()
     {
-        try
-        {
-            ColumnFamilyStore store = getCurrentColumnFamilyStore();
-            if (store != null)
-                store.forceMajorCompaction();
-        }
-        catch (InterruptedException | ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
+         ColumnFamilyStore store = getCurrentColumnFamilyStore();
+         if (store != null)
+             store.forceMajorCompaction();
     }
 
     public void disableCompaction()
@@ -537,24 +574,46 @@ public abstract class CQLTester
         return typeName;
     }
 
+    protected String createFunctionName(String keyspace)
+    {
+        return String.format("%s.function_%02d", keyspace, seqNumber.getAndIncrement());
+    }
+
+    protected void registerFunction(String functionName, String argTypes)
+    {
+        functions.add(functionName + '(' + argTypes + ')');
+    }
+
     protected String createFunction(String keyspace, String argTypes, String query) throws Throwable
     {
-        String functionName = keyspace + ".function_" + seqNumber.getAndIncrement();
+        String functionName = createFunctionName(keyspace);
+
         createFunctionOverload(functionName, argTypes, query);
         return functionName;
     }
 
     protected void createFunctionOverload(String functionName, String argTypes, String query) throws Throwable
     {
+        registerFunction(functionName, argTypes);
         String fullQuery = String.format(query, functionName);
-        functions.add(functionName + '(' + argTypes + ')');
         logger.info(fullQuery);
         schemaChange(fullQuery);
     }
 
+    protected String createAggregateName(String keyspace)
+    {
+        return String.format("%s.aggregate_%02d", keyspace, seqNumber.getAndIncrement());
+    }
+
+    protected void registerAggregate(String aggregateName, String argTypes)
+    {
+        aggregates.add(aggregateName + '(' + argTypes + ')');
+    }
+
     protected String createAggregate(String keyspace, String argTypes, String query) throws Throwable
     {
-        String aggregateName = keyspace + "." + "aggregate_" + seqNumber.getAndIncrement();
+        String aggregateName = createAggregateName(keyspace);
+
         createAggregateOverload(aggregateName, argTypes, query);
         return aggregateName;
     }
@@ -562,7 +621,7 @@ public abstract class CQLTester
     protected void createAggregateOverload(String aggregateName, String argTypes, String query) throws Throwable
     {
         String fullQuery = String.format(query, aggregateName);
-        aggregates.add(aggregateName + '(' + argTypes + ')');
+        registerAggregate(aggregateName, argTypes);
         logger.info(fullQuery);
         schemaChange(fullQuery);
     }
@@ -692,20 +751,24 @@ public abstract class CQLTester
         schemaChange(fullQuery);
     }
 
-    protected void assertLastSchemaChange(Event.SchemaChange.Change change, Event.SchemaChange.Target target,
-                                          String keyspace, String name,
-                                          String... argTypes)
+    protected static void assertSchemaChange(String query,
+                                             Event.SchemaChange.Change expectedChange,
+                                             Event.SchemaChange.Target expectedTarget,
+                                             String expectedKeyspace,
+                                             String expectedName,
+                                             String... expectedArgTypes)
     {
-        Assert.assertTrue(lastSchemaChangeResult instanceof ResultMessage.SchemaChange);
-        ResultMessage.SchemaChange schemaChange = (ResultMessage.SchemaChange) lastSchemaChangeResult;
-        Assert.assertSame(change, schemaChange.change.change);
-        Assert.assertSame(target, schemaChange.change.target);
-        Assert.assertEquals(keyspace, schemaChange.change.keyspace);
-        Assert.assertEquals(name, schemaChange.change.name);
-        Assert.assertEquals(argTypes != null ? Arrays.asList(argTypes) : null, schemaChange.change.argTypes);
+        ResultMessage actual = schemaChange(query);
+        Assert.assertTrue(actual instanceof ResultMessage.SchemaChange);
+        Event.SchemaChange schemaChange = ((ResultMessage.SchemaChange) actual).change;
+        Assert.assertSame(expectedChange, schemaChange.change);
+        Assert.assertSame(expectedTarget, schemaChange.target);
+        Assert.assertEquals(expectedKeyspace, schemaChange.keyspace);
+        Assert.assertEquals(expectedName, schemaChange.name);
+        Assert.assertEquals(expectedArgTypes != null ? Arrays.asList(expectedArgTypes) : null, schemaChange.argTypes);
     }
 
-    protected static void schemaChange(String query)
+    protected static ResultMessage schemaChange(String query)
     {
         try
         {
@@ -718,7 +781,7 @@ public abstract class CQLTester
 
             QueryOptions options = QueryOptions.forInternalCalls(Collections.<ByteBuffer>emptyList());
 
-            lastSchemaChangeResult = prepared.statement.executeInternal(queryState, options);
+            return prepared.statement.executeInternal(queryState, options);
         }
         catch (Exception e)
         {

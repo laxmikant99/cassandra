@@ -67,6 +67,12 @@ public abstract class DataLimits
         {
             return iter;
         }
+
+        @Override
+        public PartitionIterator filter(PartitionIterator iter, int nowInSec, boolean countPartitionsWithOnlyStaticData, boolean enforceStrictLiveness)
+        {
+            return iter;
+        }
     };
 
     // We currently deal with distinct queries by querying full partitions but limiting the result at 1 row per
@@ -78,6 +84,25 @@ public abstract class DataLimits
     public static DataLimits cqlLimits(int cqlRowLimit)
     {
         return new CQLLimits(cqlRowLimit);
+    }
+
+    // mixed mode partition range scans on compact storage tables without clustering columns coordinated by 2.x are
+    // returned as one (cql) row per cell, but we need to count each partition as a single row. So we just return a
+    // CQLLimits instance that doesn't count rows towards it's limit. See CASSANDRA-15072
+    public static DataLimits legacyCompactStaticCqlLimits(int cqlRowLimits)
+    {
+        return new CQLLimits(cqlRowLimits) {
+            public Counter newCounter(int nowInSec, boolean assumeLiveData, boolean countPartitionsWithOnlyStaticData, boolean enforceStrictLiveness)
+            {
+                return new CQLCounter(nowInSec, assumeLiveData, countPartitionsWithOnlyStaticData, enforceStrictLiveness) {
+                    public Row applyToRow(Row row)
+                    {
+                        // noop: only count full partitions
+                        return row;
+                    }
+                };
+            }
+        };
     }
 
     public static DataLimits cqlLimits(int cqlRowLimit, int perPartitionLimit)

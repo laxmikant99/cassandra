@@ -52,6 +52,7 @@ import org.apache.cassandra.scheduler.IRequestScheduler;
 import org.apache.cassandra.scheduler.NoScheduler;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.thrift.ThriftServer;
+import org.apache.cassandra.transport.Server;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.memory.*;
 
@@ -106,6 +107,9 @@ public class DatabaseDescriptor
 
     private static boolean daemonInitialized;
 
+    // turns some warnings into exceptions for testing
+    private static final boolean strictRuntimeChecks = Boolean.getBoolean("cassandra.strict.runtime.checks");
+
     public static boolean isDaemonInitialized()
     {
         return daemonInitialized;
@@ -147,7 +151,7 @@ public class DatabaseDescriptor
         String loaderClass = System.getProperty("cassandra.config.loader");
         ConfigurationLoader loader = loaderClass == null
                                      ? new YamlConfigurationLoader()
-                                   : FBUtilities.<ConfigurationLoader>construct(loaderClass, "configuration loading");
+                                   : FBUtilities.construct(loaderClass, "configuration loading");
         Config config = loader.loadConfig();
 
         if (!hasLoggedConfig)
@@ -210,7 +214,7 @@ public class DatabaseDescriptor
             }
             catch (UnknownHostException e)
             {
-                throw new ConfigurationException("Unknown listen_address '" + config.listen_address + "'", false);
+                throw new ConfigurationException("Unknown listen_address '" + config.listen_address + '\'', false);
             }
 
             if (listenAddress.isAnyLocalAddress())
@@ -230,7 +234,7 @@ public class DatabaseDescriptor
             }
             catch (UnknownHostException e)
             {
-                throw new ConfigurationException("Unknown broadcast_address '" + config.broadcast_address + "'", false);
+                throw new ConfigurationException("Unknown broadcast_address '" + config.broadcast_address + '\'', false);
             }
 
             if (broadcastAddress.isAnyLocalAddress())
@@ -271,7 +275,7 @@ public class DatabaseDescriptor
             }
             catch (UnknownHostException e)
             {
-                throw new ConfigurationException("Unknown broadcast_rpc_address '" + config.broadcast_rpc_address + "'", false);
+                throw new ConfigurationException("Unknown broadcast_rpc_address '" + config.broadcast_rpc_address + '\'', false);
             }
 
             if (broadcastRpcAddress.isAnyLocalAddress())
@@ -282,6 +286,40 @@ public class DatabaseDescriptor
             if (rpcAddress.isAnyLocalAddress())
                 throw new ConfigurationException("If rpc_address is set to a wildcard address (" + config.rpc_address + "), then " +
                                                  "you must set broadcast_rpc_address to a value other than " + config.rpc_address, false);
+        }
+    }
+
+    @VisibleForTesting
+    static void applyTokensConfig(Config config) throws ConfigurationException
+    {
+        if (config.num_tokens != null && config.num_tokens > MAX_NUM_TOKENS)
+            throw new ConfigurationException(String.format("A maximum number of %d tokens per node is supported", MAX_NUM_TOKENS), false);
+
+        if (config.initial_token != null)
+        {
+            Collection<String> tokens = tokensFromString(config.initial_token);
+            if (config.num_tokens == null)
+            {
+                if (tokens.size() == 1)
+                    config.num_tokens = 1;
+                else
+                    throw new ConfigurationException("initial_token was set but num_tokens is not!", false);
+            }
+
+            if (tokens.size() != config.num_tokens)
+            {
+                throw new ConfigurationException(String.format("The number of initial tokens (by initial_token) specified (%s) is different from num_tokens value (%s)",
+                                                               tokens.size(),
+                                                               config.num_tokens),
+                                                 false);
+            }
+
+            for (String token : tokens)
+                partitioner.getTokenFactory().validate(token);
+        }
+        else if (config.num_tokens == null)
+        {
+            config.num_tokens = 1;
         }
     }
 
@@ -467,22 +505,29 @@ public class DatabaseDescriptor
         {
             throw new ConfigurationException("Missing endpoint_snitch directive", false);
         }
+
+        if (conf.native_transport_max_concurrent_requests_in_bytes <= 0)
+        {
+            conf.native_transport_max_concurrent_requests_in_bytes = Runtime.getRuntime().maxMemory() / 10;
+        }
+
+        if (conf.native_transport_max_concurrent_requests_in_bytes_per_ip <= 0)
+        {
+            conf.native_transport_max_concurrent_requests_in_bytes_per_ip = Runtime.getRuntime().maxMemory() / 40;
+        }
+
         snitch = createEndpointSnitch(conf.endpoint_snitch);
         EndpointSnitchInfo.create();
 
         localDC = snitch.getDatacenter(FBUtilities.getBroadcastAddress());
-        localComparator = new Comparator<InetAddress>()
-        {
-            public int compare(InetAddress endpoint1, InetAddress endpoint2)
-            {
-                boolean local1 = localDC.equals(snitch.getDatacenter(endpoint1));
-                boolean local2 = localDC.equals(snitch.getDatacenter(endpoint2));
-                if (local1 && !local2)
-                    return -1;
-                if (local2 && !local1)
-                    return 1;
-                return 0;
-            }
+        localComparator = (endpoint1, endpoint2) -> {
+            boolean local1 = localDC.equals(snitch.getDatacenter(endpoint1));
+            boolean local2 = localDC.equals(snitch.getDatacenter(endpoint2));
+            if (local1 && !local2)
+                return -1;
+            if (local2 && !local1)
+                return 1;
+            return 0;
         };
 
         /* Request Scheduler setup */
@@ -543,7 +588,7 @@ public class DatabaseDescriptor
         if (conf.commitlog_total_space_in_mb == null)
         {
             int preferredSize = 8192;
-            int minSize = 0;
+            int minSize;
             try
             {
                 // use 1/4 of available space.  See discussion on #10013 and #10199
@@ -640,21 +685,7 @@ public class DatabaseDescriptor
         if (conf.concurrent_compactors <= 0)
             throw new ConfigurationException("concurrent_compactors should be strictly greater than 0, but was " + conf.concurrent_compactors, false);
 
-        if (conf.num_tokens == null)
-            conf.num_tokens = 1;
-        else if (conf.num_tokens > MAX_NUM_TOKENS)
-            throw new ConfigurationException(String.format("A maximum number of %d tokens per node is supported", MAX_NUM_TOKENS), false);
-
-        if (conf.initial_token != null)
-        {
-            Collection<String> tokens = tokensFromString(conf.initial_token);
-            if (tokens.size() != conf.num_tokens)
-                throw new ConfigurationException("The number of initial tokens (by initial_token) specified is different from num_tokens value", false);
-
-            for (String token : tokens)
-                partitioner.getTokenFactory().validate(token);
-        }
-
+        applyTokensConfig(config);
 
         try
         {
@@ -697,12 +728,14 @@ public class DatabaseDescriptor
             throw new ConfigurationException("index_summary_capacity_in_mb option was set incorrectly to '"
                     + conf.index_summary_capacity_in_mb + "', it should be a non-negative integer.", false);
 
-        if(conf.encryption_options != null)
+        if (conf.encryption_options != null)
         {
             logger.warn("Please rename encryption_options as server_encryption_options in the yaml");
             //operate under the assumption that server_encryption_options is not set in yaml rather than both
             conf.server_encryption_options = conf.encryption_options;
         }
+
+        conf.server_encryption_options.validate();
 
         // load the seeds for node contact points
         if (conf.seed_provider == null)
@@ -748,6 +781,20 @@ public class DatabaseDescriptor
             && !conf.client_encryption_options.enabled)
         {
             throw new ConfigurationException("Encryption must be enabled in client_encryption_options for native_transport_port_ssl", false);
+        }
+
+        // If max protocol version has been set, just validate it's within an acceptable range
+        if (conf.native_transport_max_negotiable_protocol_version != Integer.MIN_VALUE)
+        {
+            if (conf.native_transport_max_negotiable_protocol_version < Server.MIN_SUPPORTED_VERSION
+                || conf.native_transport_max_negotiable_protocol_version > Server.CURRENT_VERSION)
+            {
+                throw new ConfigurationException(String.format("Invalid setting for native_transport_max_negotiable_version (%d); " +
+                                                               "Values between %s and %s are supported",
+                                                               conf.native_transport_max_negotiable_protocol_version,
+                                                               Server.MIN_SUPPORTED_VERSION,
+                                                               Server.CURRENT_VERSION));
+            }
         }
 
         if (conf.max_value_size_in_mb == null || conf.max_value_size_in_mb <= 0)
@@ -1012,7 +1059,7 @@ public class DatabaseDescriptor
 
     public static Collection<String> tokensFromString(String tokenString)
     {
-        List<String> tokens = new ArrayList<String>();
+        List<String> tokens = new ArrayList<>();
         if (tokenString != null)
             for (String token : tokenString.split(","))
                 tokens.add(token.replaceAll("^\\s+", "").replaceAll("\\s+$", ""));
@@ -1339,6 +1386,26 @@ public class DatabaseDescriptor
         conf.tombstone_failure_threshold = threshold;
     }
 
+    public static int getCachedReplicaRowsWarnThreshold()
+    {
+        return conf.replica_filtering_protection.cached_rows_warn_threshold;
+    }
+
+    public static void setCachedReplicaRowsWarnThreshold(int threshold)
+    {
+        conf.replica_filtering_protection.cached_rows_warn_threshold = threshold;
+    }
+
+    public static int getCachedReplicaRowsFailThreshold()
+    {
+        return conf.replica_filtering_protection.cached_rows_fail_threshold;
+    }
+
+    public static void setCachedReplicaRowsFailThreshold(int threshold)
+    {
+        conf.replica_filtering_protection.cached_rows_fail_threshold = threshold;
+    }
+
     /**
      * size of commitlog segments to allocate
      */
@@ -1511,6 +1578,11 @@ public class DatabaseDescriptor
         return conf.native_transport_flush_in_batches_legacy;
     }
 
+    public static int getNativeProtocolMaxVersionOverride()
+    {
+        return conf.native_transport_max_negotiable_protocol_version;
+    }
+
     public static double getCommitLogSyncBatchWindow()
     {
         return conf.commitlog_sync_batch_window_in_ms;
@@ -1519,6 +1591,26 @@ public class DatabaseDescriptor
     public static void setCommitLogSyncBatchWindow(double windowMillis)
     {
         conf.commitlog_sync_batch_window_in_ms = windowMillis;
+    }
+
+    public static long getNativeTransportMaxConcurrentRequestsInBytesPerIp()
+    {
+        return conf.native_transport_max_concurrent_requests_in_bytes_per_ip;
+    }
+
+    public static void setNativeTransportMaxConcurrentRequestsInBytesPerIp(long maxConcurrentRequestsInBytes)
+    {
+        conf.native_transport_max_concurrent_requests_in_bytes_per_ip = maxConcurrentRequestsInBytes;
+    }
+
+    public static long getNativeTransportMaxConcurrentRequestsInBytes()
+    {
+        return conf.native_transport_max_concurrent_requests_in_bytes;
+    }
+
+    public static void setNativeTransportMaxConcurrentRequestsInBytes(long maxConcurrentRequestsInBytes)
+    {
+        conf.native_transport_max_concurrent_requests_in_bytes = maxConcurrentRequestsInBytes;
     }
 
     public static int getCommitLogSyncPeriod()
@@ -1653,7 +1745,7 @@ public class DatabaseDescriptor
     public static File getSerializedCachePath(CacheService.CacheType cacheType, String version, String extension)
     {
         String name = cacheType.toString()
-                + (version == null ? "" : "-" + version + "." + extension);
+                + (version == null ? "" : '-' + version + '.' + extension);
         return new File(conf.saved_caches_directory, name);
     }
 
@@ -1932,12 +2024,13 @@ public class DatabaseDescriptor
     {
         long heapLimit = ((long) conf.memtable_heap_space_in_mb) << 20;
         long offHeapLimit = ((long) conf.memtable_offheap_space_in_mb) << 20;
+        final MemtableCleaner cleaner = ColumnFamilyStore::flushLargestMemtable;
         switch (conf.memtable_allocation_type)
         {
             case unslabbed_heap_buffers:
-                return new HeapPool(heapLimit, conf.memtable_cleanup_threshold, new ColumnFamilyStore.FlushLargestColumnFamily());
+                return new HeapPool(heapLimit, conf.memtable_cleanup_threshold, cleaner);
             case heap_buffers:
-                return new SlabPool(heapLimit, 0, conf.memtable_cleanup_threshold, new ColumnFamilyStore.FlushLargestColumnFamily());
+                return new SlabPool(heapLimit, 0, conf.memtable_cleanup_threshold, cleaner);
             case offheap_buffers:
                 throw new ConfigurationException("offheap_buffers are not available in 3.0. They will be re-introduced in a future release, see https://issues.apache.org/jira/browse/CASSANDRA-9472 for details");
 
@@ -2105,4 +2198,40 @@ public class DatabaseDescriptor
     {
         return conf.gc_warn_threshold_in_ms;
     }
+
+    public static boolean strictRuntimeChecks()
+    {
+        return strictRuntimeChecks;
+    }
+
+    public static boolean snapshotOnDuplicateRowDetection()
+    {
+        return conf.snapshot_on_duplicate_row_detection;
+    }
+
+    public static void setSnapshotOnDuplicateRowDetection(boolean enabled)
+    {
+        conf.snapshot_on_duplicate_row_detection = enabled;
+    }
+
+    public static boolean checkForDuplicateRowsDuringReads()
+    {
+        return conf.check_for_duplicate_rows_during_reads;
+    }
+
+    public static void setCheckForDuplicateRowsDuringReads(boolean enabled)
+    {
+        conf.check_for_duplicate_rows_during_reads = enabled;
+    }
+
+    public static boolean checkForDuplicateRowsDuringCompaction()
+    {
+        return conf.check_for_duplicate_rows_during_compaction;
+    }
+
+    public static void setCheckForDuplicateRowsDuringCompaction(boolean enabled)
+    {
+        conf.check_for_duplicate_rows_during_compaction = enabled;
+    }
+
 }

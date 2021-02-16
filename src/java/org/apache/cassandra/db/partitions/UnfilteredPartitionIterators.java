@@ -47,7 +47,7 @@ public abstract class UnfilteredPartitionIterators
     public interface MergeListener
     {
         public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions);
-        public void close();
+        public default void close() {}
     }
 
     @SuppressWarnings("resource") // The created resources are returned right away
@@ -84,7 +84,6 @@ public abstract class UnfilteredPartitionIterators
 
     public static UnfilteredPartitionIterator merge(final List<? extends UnfilteredPartitionIterator> iterators, final int nowInSec, final MergeListener listener)
     {
-        assert listener != null;
         assert !iterators.isEmpty();
 
         final boolean isForThrift = iterators.get(0).isForThrift();
@@ -109,7 +108,9 @@ public abstract class UnfilteredPartitionIterators
 
             protected UnfilteredRowIterator getReduced()
             {
-                UnfilteredRowIterators.MergeListener rowListener = listener.getRowMergeListener(partitionKey, toMerge);
+                UnfilteredRowIterators.MergeListener rowListener = listener == null
+                                                                 ? null
+                                                                 : listener.getRowMergeListener(partitionKey, toMerge);
 
                 // Replace nulls by empty iterators
                 for (int i = 0; i < toMerge.size(); i++)
@@ -153,7 +154,9 @@ public abstract class UnfilteredPartitionIterators
             public void close()
             {
                 merged.close();
-                listener.close();
+
+                if (listener != null)
+                    listener.close();
             }
         };
     }
@@ -233,6 +236,8 @@ public abstract class UnfilteredPartitionIterators
     /**
      * Digests the the provided iterator.
      *
+     * Caller must close the provided iterator.
+     *
      * @param command the command that has yield {@code iterator}. This can be null if {@code version >= MessagingService.VERSION_30}
      * as this is only used when producing digest to be sent to legacy nodes.
      * @param iterator the iterator to digest.
@@ -241,14 +246,11 @@ public abstract class UnfilteredPartitionIterators
      */
     public static void digest(ReadCommand command, UnfilteredPartitionIterator iterator, MessageDigest digest, int version)
     {
-        try (UnfilteredPartitionIterator iter = iterator)
+        while (iterator.hasNext())
         {
-            while (iter.hasNext())
+            try (UnfilteredRowIterator partition = iterator.next())
             {
-                try (UnfilteredRowIterator partition = iter.next())
-                {
-                    UnfilteredRowIterators.digest(command, partition, digest, version);
-                }
+                UnfilteredRowIterators.digest(command, partition, digest, version);
             }
         }
     }

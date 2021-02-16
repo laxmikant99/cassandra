@@ -68,7 +68,7 @@ public class Frame
 
     public static Frame create(Message.Type type, int streamId, int version, EnumSet<Header.Flag> flags, ByteBuf body)
     {
-        Header header = new Header(version, flags, streamId, type);
+        Header header = new Header(version, flags, streamId, type, body.readableBytes());
         return new Frame(header, body);
     }
 
@@ -83,18 +83,20 @@ public class Frame
         public final EnumSet<Flag> flags;
         public final int streamId;
         public final Message.Type type;
+        public final long bodySizeInBytes;
 
-        private Header(int version, int flags, int streamId, Message.Type type)
+        private Header(int version, int flags, int streamId, Message.Type type, long bodySizeInBytes)
         {
-            this(version, Flag.deserialize(flags), streamId, type);
+            this(version, Flag.deserialize(flags), streamId, type, bodySizeInBytes);
         }
 
-        private Header(int version, EnumSet<Flag> flags, int streamId, Message.Type type)
+        private Header(int version, EnumSet<Flag> flags, int streamId, Message.Type type, long bodySizeInBytes)
         {
             this.version = version;
             this.flags = flags;
             this.streamId = streamId;
             this.type = type;
+            this.bodySizeInBytes = bodySizeInBytes;
         }
 
         public static enum Flag
@@ -143,10 +145,12 @@ public class Frame
         private int tooLongStreamId;
 
         private final Connection.Factory factory;
+        private final ProtocolVersionLimit versionCap;
 
-        public Decoder(Connection.Factory factory)
+        public Decoder(Connection.Factory factory, ProtocolVersionLimit versionCap)
         {
             this.factory = factory;
+            this.versionCap = versionCap;
         }
 
         @Override
@@ -173,10 +177,10 @@ public class Frame
             int firstByte = buffer.getByte(idx++);
             Message.Direction direction = Message.Direction.extractFromVersion(firstByte);
             int version = firstByte & PROTOCOL_VERSION_MASK;
-            if (version < Server.MIN_SUPPORTED_VERSION || version > Server.CURRENT_VERSION)
+            if (version < Server.MIN_SUPPORTED_VERSION || version > versionCap.getMaxVersion())
                 throw new ProtocolException(String.format("Invalid or unsupported protocol version (%d); the lowest supported version is %d and the greatest is %d",
-                                                          version, Server.MIN_SUPPORTED_VERSION, Server.CURRENT_VERSION),
-                                            version);
+                                                          version, Server.MIN_SUPPORTED_VERSION, versionCap.getMaxVersion()),
+                                            version < Server.MIN_SUPPORTED_VERSION ? version : null);
 
             // Wait until we have the complete header
             if (readableBytes < Header.LENGTH)
@@ -240,7 +244,7 @@ public class Frame
                         streamId);
             }
 
-            results.add(new Frame(new Header(version, flags, streamId, type), body));
+            results.add(new Frame(new Header(version, flags, streamId, type, bodyLength), body));
         }
 
         private void fail()

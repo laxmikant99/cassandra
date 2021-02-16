@@ -26,6 +26,8 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import javax.annotation.Nullable;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Objects;
@@ -117,6 +119,8 @@ public final class CFMetaData
     // that as convenience to access that column more easily (but we could replace calls by partitionColumns().iterator().next()
     // for those tables in practice).
     private volatile ColumnDefinition compactValueColumn;
+
+    private volatile Set<ColumnDefinition> hiddenColumns;
 
     /**
      * These two columns are "virtual" (e.g. not persisted together with schema).
@@ -381,6 +385,24 @@ public final class CFMetaData
             this.comparator = new ClusteringComparator(clusteringColumns.get(0).type);
         else
             this.comparator = new ClusteringComparator(extractTypes(clusteringColumns));
+
+        Set<ColumnDefinition> hiddenColumns;
+        if (isCompactTable() && isDense && CompactTables.hasEmptyCompactValue(this))
+        {
+            hiddenColumns = Collections.singleton(compactValueColumn);
+        }
+        else if (isCompactTable() && !isDense && !isSuper)
+        {
+            hiddenColumns = Sets.newHashSetWithExpectedSize(clusteringColumns.size() + 1);
+            hiddenColumns.add(compactValueColumn);
+            hiddenColumns.addAll(clusteringColumns);
+
+        }
+        else
+        {
+            hiddenColumns = Collections.emptySet();
+        }
+        this.hiddenColumns = hiddenColumns;
     }
 
     public Indexes getIndexes()
@@ -592,6 +614,27 @@ public final class CFMetaData
                                        superCfValueColumn),
                         this);
     }
+
+    public CFMetaData copyWithNewCompactValueType(AbstractType<?> type)
+    {
+        assert isDense && compactValueColumn.type instanceof EmptyType && partitionColumns.size() == 1;
+        return copyOpts(new CFMetaData(ksName,
+                                       cfName,
+                                       cfId,
+                                       isSuper,
+                                       isCounter,
+                                       isDense,
+                                       isCompound,
+                                       isView,
+                                       copy(partitionKeyColumns),
+                                       copy(clusteringColumns),
+                                       PartitionColumns.of(compactValueColumn.withNewType(type)),
+                                       partitioner,
+                                       superCfKeyColumn,
+                                       superCfValueColumn),
+                        this);
+    }
+
 
     private static List<ColumnDefinition> copy(List<ColumnDefinition> l)
     {
@@ -952,7 +995,7 @@ public final class CFMetaData
      */
     public ColumnDefinition getColumnDefinition(ColumnIdentifier name)
     {
-       return getColumnDefinition(name.bytes);
+        return getColumnDefinition(name.bytes);
     }
 
     // In general it is preferable to work with ColumnIdentifier to make it
@@ -962,6 +1005,18 @@ public final class CFMetaData
     public ColumnDefinition getColumnDefinition(ByteBuffer name)
     {
         return columnMetadata.get(name);
+    }
+
+    // Returns only columns that are supposed to be visible through CQL layer
+    public ColumnDefinition getColumnDefinitionForCQL(ColumnIdentifier name)
+    {
+        return getColumnDefinitionForCQL(name.bytes);
+    }
+
+    public ColumnDefinition getColumnDefinitionForCQL(ByteBuffer name)
+    {
+        ColumnDefinition cd = getColumnDefinition(name);
+        return hiddenColumns.contains(cd) ? null : cd;
     }
 
     public static boolean isNameValid(String name)
@@ -1089,12 +1144,18 @@ public final class CFMetaData
      */
     public void recordColumnDrop(ColumnDefinition def, long deleteTimestamp)
     {
-        droppedColumns.put(def.name.bytes, new DroppedColumn(def.name.toString(), def.type, deleteTimestamp));
+        recordColumnDrop(def, deleteTimestamp, true);
+    }
+
+    @VisibleForTesting
+    public void recordColumnDrop(ColumnDefinition def, long deleteTimestamp, boolean preserveKind)
+    {
+        droppedColumns.put(def.name.bytes, new DroppedColumn(def.name.toString(), preserveKind ? def.kind : null, def.type, deleteTimestamp));
     }
 
     public void renameColumn(ColumnIdentifier from, ColumnIdentifier to) throws InvalidRequestException
     {
-        ColumnDefinition def = getColumnDefinition(from);
+        ColumnDefinition def = getColumnDefinitionForCQL(from);
 
         if (def == null)
             throw new InvalidRequestException(String.format("Cannot rename unknown column %s in keyspace %s", from, cfName));
@@ -1513,9 +1574,13 @@ public final class CFMetaData
         // drop timestamp, in microseconds, yet with millisecond granularity
         public final long droppedTime;
 
-        public DroppedColumn(String name, AbstractType<?> type, long droppedTime)
+        @Nullable
+        public final ColumnDefinition.Kind kind;
+
+        public DroppedColumn(String name, ColumnDefinition.Kind kind, AbstractType<?> type, long droppedTime)
         {
             this.name = name;
+            this.kind = kind;
             this.type = type;
             this.droppedTime = droppedTime;
         }
@@ -1531,13 +1596,16 @@ public final class CFMetaData
 
             DroppedColumn dc = (DroppedColumn) o;
 
-            return name.equals(dc.name) && type.equals(dc.type) && droppedTime == dc.droppedTime;
+            return name.equals(dc.name)
+                && kind == dc.kind
+                && type.equals(dc.type)
+                && droppedTime == dc.droppedTime;
         }
 
         @Override
         public int hashCode()
         {
-            return Objects.hashCode(name, type, droppedTime);
+            return Objects.hashCode(name, kind, type, droppedTime);
         }
 
         @Override
@@ -1545,6 +1613,7 @@ public final class CFMetaData
         {
             return MoreObjects.toStringHelper(this)
                               .add("name", name)
+                              .add("kind", kind)
                               .add("type", type)
                               .add("droppedTime", droppedTime)
                               .toString();
