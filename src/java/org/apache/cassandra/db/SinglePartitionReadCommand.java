@@ -27,8 +27,6 @@ import com.google.common.collect.Sets;
 import org.apache.cassandra.cache.IRowCacheEntry;
 import org.apache.cassandra.cache.RowCacheKey;
 import org.apache.cassandra.cache.RowCacheSentinel;
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -415,6 +413,11 @@ public class SinglePartitionReadCommand extends ReadCommand
         return DatabaseDescriptor.getReadRpcTimeout();
     }
 
+    public boolean isReversed()
+    {
+        return clusteringIndexFilter.isReversed();
+    }
+
     public boolean selectsKey(DecoratedKey key)
     {
         if (!this.partitionKey().equals(key))
@@ -705,92 +708,81 @@ public class SinglePartitionReadCommand extends ReadCommand
              * We can't eliminate full sstables based on the timestamp of what we've already read like
              * in collectTimeOrderedData, but we still want to eliminate sstable whose maxTimestamp < mostRecentTombstone
              * we've read. We still rely on the sstable ordering by maxTimestamp since if
-             *   maxTimestamp_s1 > maxTimestamp_s0,
+             *   maxTimestamp_s1 < maxTimestamp_s0,
              * we're guaranteed that s1 cannot have a row tombstone such that
              *   timestamp(tombstone) > maxTimestamp_s0
              * since we necessarily have
              *   timestamp(tombstone) <= maxTimestamp_s1
-             * In other words, iterating in maxTimestamp order allow to do our mostRecentPartitionTombstone elimination
-             * in one pass, and minimize the number of sstables for which we read a partition tombstone.
+             * In other words, iterating in descending maxTimestamp order allow to do our mostRecentPartitionTombstone
+             * elimination in one pass, and minimize the number of sstables for which we read a partition tombstone.
              */
             Collections.sort(view.sstables, SSTableReader.maxTimestampComparator);
-            List<SSTableReader> skippedSSTables = null;
             long mostRecentPartitionTombstone = Long.MIN_VALUE;
-            long minTimestamp = Long.MAX_VALUE;
             int nonIntersectingSSTables = 0;
+            int includedDueToTombstones = 0;
             SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();
 
             for (SSTableReader sstable : view.sstables)
             {
-                minTimestamp = Math.min(minTimestamp, sstable.getMinTimestamp());
                 // if we've already seen a partition tombstone with a timestamp greater
                 // than the most recent update to this sstable, we can skip it
                 if (sstable.getMaxTimestamp() < mostRecentPartitionTombstone)
                     break;
 
-                if (!shouldInclude(sstable))
+                if (shouldInclude(sstable))
                 {
-                    nonIntersectingSSTables++;
-                    // sstable contains no tombstone if maxLocalDeletionTime == Integer.MAX_VALUE, so we can safely skip those entirely
-                    if (sstable.hasTombstones())
-                    {
-                        if (skippedSSTables == null)
-                            skippedSSTables = new ArrayList<>();
-                        skippedSSTables.add(sstable);
-                    }
-                    continue;
-                }
+                    if (!sstable.isRepaired())
+                        oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());
 
-                if (!sstable.isRepaired())
-                    oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());
-
-                // 'iter' is added to iterators which is closed on exception, or through the closing of the final merged iterator
-                @SuppressWarnings("resource")
-                UnfilteredRowIterator iter = filter.filter(
-                    sstable.iterator(partitionKey(),
-                                     columnFilter(),
-                                     filter.isReversed(),
-                                     isForThrift(),
-                                     metricsCollector)
-                );
-
-                if (isForThrift())
-                    iter = ThriftResultsMerger.maybeWrap(iter, nowInSec());
-
-                iterators.add(RTBoundValidator.validate(iter, RTBoundValidator.Stage.SSTABLE, false));
-
-                mostRecentPartitionTombstone = Math.max(mostRecentPartitionTombstone, iter.partitionLevelDeletion().markedForDeleteAt());
-            }
-
-            int includedDueToTombstones = 0;
-            // Check for partition tombstones in the skipped sstables
-            if (skippedSSTables != null)
-            {
-                for (SSTableReader sstable : skippedSSTables)
-                {
-                    if (sstable.getMaxTimestamp() <= minTimestamp)
-                        continue;
-
-                    @SuppressWarnings("resource") // 'iter' is either closed right away, or added to iterators which is close on exception, or through the closing of the final merged iterator
+                    // 'iter' is added to iterators which is closed on exception, or through the closing of the final merged iterator
+                    @SuppressWarnings("resource")
                     UnfilteredRowIterator iter = filter.filter(sstable.iterator(partitionKey(),
                                                                                 columnFilter(),
                                                                                 filter.isReversed(),
                                                                                 isForThrift(),
                                                                                 metricsCollector));
 
-                    if (iter.partitionLevelDeletion().markedForDeleteAt() > minTimestamp)
+                    if (isForThrift())
+                        iter = ThriftResultsMerger.maybeWrap(iter, nowInSec());
+
+                    iterators.add(RTBoundValidator.validate(iter, RTBoundValidator.Stage.SSTABLE, false));
+                    mostRecentPartitionTombstone = Math.max(mostRecentPartitionTombstone,
+                                                            iter.partitionLevelDeletion().markedForDeleteAt());
+                }
+                else
+                {
+
+                    nonIntersectingSSTables++;
+                    // sstable contains no tombstone if maxLocalDeletionTime == Integer.MAX_VALUE, so we can safely skip those entirely
+                    if (sstable.hasTombstones())
                     {
-                        iterators.add(iter);
-                        if (!sstable.isRepaired())
-                            oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());
-                        includedDueToTombstones++;
-                    }
-                    else
-                    {
-                        iter.close();
+                        // 'iter' is added to iterators which is closed on exception, or through the closing of the final merged iterator
+                        @SuppressWarnings("resource")
+                        UnfilteredRowIterator iter = filter.filter(sstable.iterator(partitionKey(),
+                                                                                    columnFilter(),
+                                                                                    filter.isReversed(),
+                                                                                    isForThrift(),
+                                                                                    metricsCollector));
+                        // if the sstable contains a partition delete, then we must include it regardless of whether it
+                        // shadows any other data seen locally as we can't guarantee that other replicas have seen it
+                        if (!iter.partitionLevelDeletion().isLive())
+                        {
+                            includedDueToTombstones++;
+                            iterators.add(RTBoundValidator.validate(iter, RTBoundValidator.Stage.SSTABLE, false));
+                            if (!sstable.isRepaired())
+                                oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, sstable.getMinLocalDeletionTime());
+                            mostRecentPartitionTombstone = Math.max(mostRecentPartitionTombstone,
+                                                                    iter.partitionLevelDeletion().markedForDeleteAt());
+                        }
+                        else
+                        {
+                            iter.close();
+                        }
+
                     }
                 }
             }
+
             if (Tracing.isTracing())
                 Tracing.trace("Skipped {}/{} non-slice-intersecting sstables, included {} due to tombstones",
                               nonIntersectingSSTables, view.sstables.size(), includedDueToTombstones);
@@ -875,11 +867,11 @@ public class SinglePartitionReadCommand extends ReadCommand
                 if (iter.isEmpty())
                     continue;
 
-                UnfilteredRowIterator clonedFilter = copyOnHeap
+                UnfilteredRowIterator clonedIter = copyOnHeap
                                                    ? UnfilteredRowIterators.cloningIterator(iter, HeapAllocator.instance)
                                                    : iter;
                 result = add(
-                    RTBoundValidator.validate(isForThrift() ? ThriftResultsMerger.maybeWrap(clonedFilter, nowInSec()) : clonedFilter, RTBoundValidator.Stage.MEMTABLE, false),
+                    RTBoundValidator.validate(isForThrift() ? ThriftResultsMerger.maybeWrap(clonedIter, nowInSec()) : clonedIter, RTBoundValidator.Stage.MEMTABLE, false),
                     result,
                     filter,
                     false
@@ -889,7 +881,6 @@ public class SinglePartitionReadCommand extends ReadCommand
 
         /* add the SSTables on disk */
         Collections.sort(view.sstables, SSTableReader.maxTimestampComparator);
-        boolean onlyUnrepaired = true;
         // read sorted sstables
         SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();
         for (SSTableReader sstable : view.sstables)
@@ -902,6 +893,7 @@ public class SinglePartitionReadCommand extends ReadCommand
 
             long currentMaxTs = sstable.getMaxTimestamp();
             filter = reduceFilter(filter, result, currentMaxTs);
+
             if (filter == null)
                 break;
 
@@ -958,9 +950,6 @@ public class SinglePartitionReadCommand extends ReadCommand
                 if (iter.isEmpty())
                     continue;
 
-                if (sstable.isRepaired())
-                    onlyUnrepaired = false;
-
                 result = add(
                     RTBoundValidator.validate(isForThrift() ? ThriftResultsMerger.maybeWrap(iter, nowInSec()) : iter, RTBoundValidator.Stage.SSTABLE, false),
                     result,
@@ -977,30 +966,6 @@ public class SinglePartitionReadCommand extends ReadCommand
 
         DecoratedKey key = result.partitionKey();
         cfs.metric.samplers.get(TableMetrics.Sampler.READS).addSample(key.getKey(), key.hashCode(), 1);
-
-        // "hoist up" the requested data into a more recent sstable
-        if (metricsCollector.getMergedSSTables() > cfs.getMinimumCompactionThreshold()
-            && onlyUnrepaired
-            && !cfs.isAutoCompactionDisabled()
-            && cfs.getCompactionStrategyManager().shouldDefragment())
-        {
-            // !!WARNING!!   if we stop copying our data to a heap-managed object,
-            //               we will need to track the lifetime of this mutation as well
-            Tracing.trace("Defragmenting requested data");
-
-            try (UnfilteredRowIterator iter = result.unfilteredIterator(columnFilter(), Slices.ALL, false))
-            {
-                final Mutation mutation = new Mutation(PartitionUpdate.fromIterator(iter));
-                StageManager.getStage(Stage.MUTATION).execute(new Runnable()
-                {
-                    public void run()
-                    {
-                        // skipping commitlog and index updates is fine since we're just de-fragmenting existing data
-                        Keyspace.open(mutation.getKeyspaceName()).apply(mutation, false, false);
-                    }
-                });
-            }
-        }
 
         return result.unfilteredIterator(columnFilter(), Slices.ALL, clusteringIndexFilter().isReversed());
     }
@@ -1031,21 +996,19 @@ public class SinglePartitionReadCommand extends ReadCommand
         NavigableSet<Clustering> clusterings = filter.requestedRows();
 
         // We want to remove rows for which we have values for all requested columns. We have to deal with both static and regular rows.
-        // TODO: we could also remove a selected column if we've found values for every requested row but we'll leave
-        // that for later.
 
         boolean removeStatic = false;
         if (!columns.statics.isEmpty())
         {
             Row staticRow = searchIter.next(Clustering.STATIC_CLUSTERING);
-            removeStatic = staticRow != null && canRemoveRow(staticRow, columns.statics, sstableTimestamp);
+            removeStatic = staticRow != null && isRowComplete(staticRow, columns.statics, sstableTimestamp);
         }
 
         NavigableSet<Clustering> toRemove = null;
         for (Clustering clustering : clusterings)
         {
             Row row = searchIter.next(clustering);
-            if (row == null || !canRemoveRow(row, columns.regulars, sstableTimestamp))
+            if (row == null || !isRowComplete(row, columns.regulars, sstableTimestamp))
                 continue;
 
             if (toRemove == null)
@@ -1071,20 +1034,44 @@ public class SinglePartitionReadCommand extends ReadCommand
         return new ClusteringIndexNamesFilter(clusterings, filter.isReversed());
     }
 
-    private boolean canRemoveRow(Row row, Columns requestedColumns, long sstableTimestamp)
+    /**
+     * We can stop reading row data from disk if what we've already read is more recent than the max timestamp
+     * of the next newest SSTable that might have data for the query. We care about 1.) the row timestamp (since
+     * every query cares if the row exists or not), 2.) the timestamps of the requested cells, and 3.) whether or
+     * not any of the cells we've read have actual data.
+     *
+     * @param row a potentially incomplete {@link Row}
+     * @param requestedColumns the columns requested by the query
+     * @param sstableTimestamp the max timestamp of the next newest SSTable to read
+     *
+     * @return true if the supplied {@link Row} is complete and its data more recent than the supplied timestamp
+     */
+    private boolean isRowComplete(Row row, Columns requestedColumns, long sstableTimestamp)
     {
-        // We can remove a row if it has data that is more recent that the next sstable to consider for the data that the query
-        // cares about. And the data we care about is 1) the row timestamp (since every query cares if the row exists or not)
-        // and 2) the requested columns.
-        if (row.primaryKeyLivenessInfo().isEmpty() || row.primaryKeyLivenessInfo().timestamp() <= sstableTimestamp)
-            return false;
+        // Static rows do not have row deletion or primary key liveness info
+        if (!row.isStatic())
+        {
+            // If the row has been deleted or is part of a range deletion we know that we have enough information and can
+            // stop at this point.
+            // Note that deleted rows in compact tables (non static) do not have a row deletion. Single column
+            // cells are deleted instead. By consequence this check will not work for those, but the row will appear as complete later on
+            // in the method.
+            if (!row.deletion().isLive() && row.deletion().time().deletes(sstableTimestamp))
+                return true;
+
+            // Note that compact tables will always have an empty primary key liveness info.
+            if (metadata().isCQLTable() && (row.primaryKeyLivenessInfo().isEmpty() || row.primaryKeyLivenessInfo().timestamp() <= sstableTimestamp))
+                return false;
+        }
 
         for (ColumnDefinition column : requestedColumns)
         {
             Cell cell = row.getCell(column);
+
             if (cell == null || cell.timestamp() <= sstableTimestamp)
                 return false;
         }
+
         return true;
     }
 

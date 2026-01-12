@@ -37,6 +37,7 @@ import com.googlecode.concurrentlinkedhashmap.EntryWeigher;
 import com.googlecode.concurrentlinkedhashmap.EvictionListener;
 import org.antlr.runtime.*;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.functions.FunctionName;
@@ -47,6 +48,7 @@ import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.PartitionIterators;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.metrics.CQLMetrics;
 import org.apache.cassandra.service.*;
 import org.apache.cassandra.service.pager.QueryPager;
@@ -61,9 +63,13 @@ public class QueryProcessor implements QueryHandler
 {
     public static final CassandraVersion CQL_VERSION = new CassandraVersion("3.4.0");
 
+    // See comments on QueryProcessor #prepare
+    public static final CassandraVersion NEW_PREPARED_STATEMENT_BEHAVIOUR_SINCE = new CassandraVersion("3.0.26");
+
     public static final QueryProcessor instance = new QueryProcessor();
 
     private static final Logger logger = LoggerFactory.getLogger(QueryProcessor.class);
+    private static final NoSpamLogger nospam = NoSpamLogger.getLogger(logger, 10, TimeUnit.MINUTES);
     private static final MemoryMeter meter = new MemoryMeter().withGuessing(MemoryMeter.Guess.FALLBACK_BEST).ignoreKnownSingletons();
     private static final long MAX_CACHE_PREPARED_MEMORY = Runtime.getRuntime().maxMemory() / 256;
 
@@ -167,6 +173,12 @@ public class QueryProcessor implements QueryHandler
     private QueryProcessor()
     {
         MigrationManager.instance.register(new MigrationSubscriber());
+    }
+
+    @VisibleForTesting
+    public void evictPrepared(MD5Digest id)
+    {
+        preparedStatements.remove(id);
     }
 
     public ParsedStatement.Prepared getPrepared(MD5Digest id)
@@ -388,19 +400,111 @@ public class QueryProcessor implements QueryHandler
         return prepare(queryString, cState, cState instanceof ThriftClientState);
     }
 
-    public static ResultMessage.Prepared prepare(String queryString, ClientState clientState, boolean forThrift)
+    private volatile boolean newPreparedStatementBehaviour = false;
+    public boolean useNewPreparedStatementBehaviour()
     {
-        ResultMessage.Prepared existing = getStoredPreparedStatement(queryString, clientState.getRawKeyspace(), forThrift);
-        if (existing != null)
-            return existing;
+        if (newPreparedStatementBehaviour || DatabaseDescriptor.getForceNewPreparedStatementBehaviour())
+            return true;
+
+        synchronized (this)
+        {
+            CassandraVersion minVersion = Gossiper.instance.getMinVersion(DatabaseDescriptor.getWriteRpcTimeout(), TimeUnit.MILLISECONDS);
+            if (minVersion != null && minVersion.compareTo(NEW_PREPARED_STATEMENT_BEHAVIOUR_SINCE) >= 0)
+            {
+                logger.info("Fully upgraded to at least {}", NEW_PREPARED_STATEMENT_BEHAVIOUR_SINCE);
+                newPreparedStatementBehaviour = true;
+            }
+
+            return newPreparedStatementBehaviour;
+        }
+    }
+
+    /**
+     * This method got slightly out of hand, but this is with best intentions: to allow users to be upgraded from any
+     * prior version, and help implementers avoid previous mistakes by clearly separating fully qualified and non-fully
+     * qualified statement behaviour.
+     *
+     * Basically we need to handle 4 different hashes here;
+     * 1. fully qualified query with keyspace
+     * 2. fully qualified query without keyspace
+     * 3. unqualified query with keyspace
+     * 4. unqualified query without keyspace
+     *
+     * The correct combination to return is 2/3 - the problem is during upgrades (assuming upgrading from < 3.0.26)
+     * - Existing clients have hash 1 or 3
+     * - Query prepared on a 3.0.26 instance needs to return hash 1/3 to be able to execute it on a 3.0.25 instance
+     * - This is handled by the useNewPreparedStatementBehaviour flag - while there still are 3.0.25 instances in
+     *   the cluster we always return hash 1/3
+     * - Once fully upgraded we start returning hash 2/3, this will cause a prepared statement id mismatch for existing
+     *   clients, but they will be able to continue using the old prepared statement id after that exception since we
+     *   store the query both with and without keyspace.
+     */
+    public ResultMessage.Prepared prepare(String queryString, ClientState clientState, boolean forThrift)
+    {
+        boolean newPreparedStatementBehaviour = useNewPreparedStatementBehaviour();
+        MD5Digest hashWithoutKeyspace = computeId(queryString, null);
+        MD5Digest hashWithKeyspace = computeId(queryString, clientState.getRawKeyspace());
+        ParsedStatement.Prepared cachedWithoutKeyspace = preparedStatements.get(hashWithoutKeyspace);
+        ParsedStatement.Prepared cachedWithKeyspace = preparedStatements.get(hashWithKeyspace);
+        // We assume it is only safe to return cached prepare if we have both instances
+        boolean safeToReturnCached = cachedWithoutKeyspace != null && cachedWithKeyspace != null;
+
+        if (!forThrift)
+        {
+            if (safeToReturnCached)
+            {
+                if (newPreparedStatementBehaviour)
+                {
+                    if (cachedWithoutKeyspace.fullyQualified) // For fully qualified statements, we always skip keyspace to avoid digest switching
+                        return new ResultMessage.Prepared(hashWithoutKeyspace, cachedWithoutKeyspace);
+
+                    if (clientState.getRawKeyspace() != null && !cachedWithKeyspace.fullyQualified) // For non-fully qualified statements, we always include keyspace to avoid ambiguity
+                        return new ResultMessage.Prepared(hashWithKeyspace, cachedWithKeyspace);
+                }
+                else // legacy caches, pre-CASSANDRA-15252 behaviour
+                {
+                    return new ResultMessage.Prepared(hashWithKeyspace, cachedWithKeyspace);
+                }
+            }
+            else
+            {
+                // Make sure the missing one is going to be eventually re-prepared
+                evictPrepared(hashWithKeyspace);
+                evictPrepared(hashWithoutKeyspace);
+            }
+        }
 
         ParsedStatement.Prepared prepared = getStatement(queryString, clientState);
+        prepared.rawCQLStatement = queryString;
+
         int boundTerms = prepared.statement.getBoundTerms();
         if (boundTerms > FBUtilities.MAX_UNSIGNED_SHORT)
             throw new InvalidRequestException(String.format("Too many markers(?). %d markers exceed the allowed maximum of %d", boundTerms, FBUtilities.MAX_UNSIGNED_SHORT));
         assert boundTerms == prepared.boundNames.size();
 
-        return storePreparedStatement(queryString, clientState.getRawKeyspace(), prepared, forThrift);
+        if (prepared.fullyQualified)
+        {
+            ResultMessage.Prepared qualifiedWithoutKeyspace = storePreparedStatement(queryString, null, prepared, forThrift);
+            ResultMessage.Prepared qualifiedWithKeyspace = null;
+            if (clientState.getRawKeyspace() != null)
+                qualifiedWithKeyspace = storePreparedStatement(queryString, clientState.getRawKeyspace(), prepared, forThrift);
+
+            if (!newPreparedStatementBehaviour && qualifiedWithKeyspace != null)
+                return qualifiedWithKeyspace;
+
+            return qualifiedWithoutKeyspace;
+        }
+        else
+        {
+            clientState.warnAboutUseWithPreparedStatements(hashWithKeyspace, clientState.getRawKeyspace());
+
+            ResultMessage.Prepared nonQualifiedWithKeyspace = storePreparedStatement(queryString, clientState.getRawKeyspace(), prepared, forThrift);
+            ResultMessage.Prepared nonQualifiedWithoutKeyspace = storePreparedStatement(queryString, null, prepared, forThrift);
+            if (!newPreparedStatementBehaviour)
+                return nonQualifiedWithoutKeyspace;
+
+            return nonQualifiedWithKeyspace;
+        }
     }
 
     private static MD5Digest computeId(String queryString, String keyspace)
@@ -415,24 +519,26 @@ public class QueryProcessor implements QueryHandler
         return toHash.hashCode();
     }
 
-    private static ResultMessage.Prepared getStoredPreparedStatement(String queryString, String keyspace, boolean forThrift)
+    @VisibleForTesting
+    public static ResultMessage.Prepared getStoredPreparedStatement(String queryString, String clientKeyspace, boolean forThrift)
     throws InvalidRequestException
     {
         if (forThrift)
         {
-            Integer thriftStatementId = computeThriftId(queryString, keyspace);
+            Integer thriftStatementId = computeThriftId(queryString, clientKeyspace);
             ParsedStatement.Prepared existing = thriftPreparedStatements.get(thriftStatementId);
             return existing == null ? null : ResultMessage.Prepared.forThrift(thriftStatementId, existing.boundNames);
         }
         else
         {
-            MD5Digest statementId = computeId(queryString, keyspace);
+            MD5Digest statementId = computeId(queryString, clientKeyspace);
             ParsedStatement.Prepared existing = preparedStatements.get(statementId);
             return existing == null ? null : new ResultMessage.Prepared(statementId, existing);
         }
     }
 
-    private static ResultMessage.Prepared storePreparedStatement(String queryString, String keyspace, ParsedStatement.Prepared prepared, boolean forThrift)
+    @VisibleForTesting
+    public static ResultMessage.Prepared storePreparedStatement(String queryString, String keyspace, ParsedStatement.Prepared prepared, boolean forThrift)
     throws InvalidRequestException
     {
         // Concatenate the current keyspace so we don't mix prepared statements between keyspace (#5352).
@@ -558,6 +664,18 @@ public class QueryProcessor implements QueryHandler
     public static void clearInternalStatementsCache()
     {
         internalStatements.clear();
+    }
+
+    @VisibleForTesting
+    public static void clearPreparedStatementsCache()
+    {
+        preparedStatements.clear();
+        thriftPreparedStatements.clear();
+    }
+
+    public static List<ParsedStatement.Prepared> getPreparedStatements()
+    {
+        return new ArrayList<>(preparedStatements.values());
     }
 
     private static class MigrationSubscriber extends MigrationListener

@@ -49,7 +49,6 @@ import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableTxnWriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
-import org.apache.cassandra.io.util.DiskAwareRunnable;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
@@ -70,7 +69,7 @@ public class Memtable implements Comparable<Memtable>
     private final AtomicLong liveDataSize = new AtomicLong(0);
     private final AtomicLong currentOperations = new AtomicLong(0);
 
-    // the write barrier for directing writes to this memtable during a switch
+    // the write barrier for directing writes to this memtable or the next during a switch
     private volatile OpOrder.Barrier writeBarrier;
     // the precise upper bound of ReplayPosition owned by this memtable
     private volatile AtomicReference<ReplayPosition> commitLogUpperBound;
@@ -340,7 +339,7 @@ public class Memtable implements Comparable<Memtable>
     @VisibleForTesting
     public void makeUnflushable()
     {
-        liveDataSize.addAndGet(1L * 1024 * 1024 * 1024 * 1024 * 1024);
+        liveDataSize.addAndGet((long) 1024 * 1024 * 1024 * 1024 * 1024);
     }
 
     private long estimatedSize()
@@ -381,7 +380,7 @@ public class Memtable implements Comparable<Memtable>
                 if (isBatchLogTable && !partition.partitionLevelDeletion().isLive() && partition.hasRows())
                     continue;
 
-                if (trackContention && partition.usePessimisticLocking())
+                if (trackContention && partition.useLock())
                     heavilyContendedRowCount++;
 
                 if (!partition.isEmpty())
@@ -434,7 +433,7 @@ public class Memtable implements Comparable<Memtable>
 
             return new SSTableTxnWriter(txn,
                                         cfs.createSSTableMultiWriter(Descriptor.fromFilename(filename),
-                                                                     (long) partitions.size(),
+                                                                     partitions.size(),
                                                                      ActiveRepairService.UNREPAIRED_SSTABLE,
                                                                      sstableMetadataCollector,
                                                                      new SerializationHeader(true, cfs.metadata, columns, stats),

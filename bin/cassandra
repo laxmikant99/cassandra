@@ -27,9 +27,11 @@
 # behavior, those variables are:
 #
 #   CLASSPATH -- A Java classpath containing everything necessary to run.
+#   EXTRA_CLASSPATH -- A Java classpath with anything to be appended to CLASSPATH
 #   JVM_OPTS -- Additional arguments to the JVM for heap size, etc
 #   JVM_ON_OUT_OF_MEMORY_ERROR_OPT -- The OnOutOfMemoryError JVM option if specified
 #   CASSANDRA_CONF -- Directory containing Cassandra configuration files.
+#   CASSANDRA_LOG_DIR -- Directory containing logs(default: $CASSANDRA_HOME/logs).
 #
 # As a convenience, a fragment of shell is sourced in order to set one or
 # more of these variables. This so-called `include' can be placed in a 
@@ -96,7 +98,7 @@ if [ -n "$JAVA_HOME" ]; then
         fi
     done
 else
-    JAVA=java
+    JAVA=`command -v java 2> /dev/null`
 fi
 
 if [ -z $JAVA ] ; then
@@ -125,6 +127,10 @@ if [ -f "$CASSANDRA_CONF/cassandra-env.sh" ]; then
     . "$CASSANDRA_CONF/cassandra-env.sh"
 fi
 
+if [ -z "$CASSANDRA_LOG_DIR" ]; then
+  CASSANDRA_LOG_DIR=$CASSANDRA_HOME/logs
+fi
+
 # Special-case path variables.
 case "`uname`" in
     CYGWIN*|MINGW*) 
@@ -146,21 +152,27 @@ find_library()
     pattern=$1
     path=$(echo ${2} | tr ":" " ")
 
-    find $path -regex "$pattern" -print 2>/dev/null | head -n 1
+    find $path -regex "$pattern" -print 2>/dev/null | sort -ru | head -n 1
 }
 case "`uname -s`" in
     Linux)
         if [ -z $CASSANDRA_LIBJEMALLOC ] ; then
+            dirs="/lib64 /lib /usr/lib64 /usr/lib "
             which ldconfig > /dev/null 2>&1
             if [ $? = 0 ] ; then
-                # e.g. for CentOS
-                dirs="/lib64 /lib /usr/lib64 /usr/lib `ldconfig -v 2>/dev/null | grep -v '^\s' | sed 's/^\([^:]*\):.*$/\1/'`"
-            else
-                # e.g. for Debian, OpenSUSE
-                dirs="/lib64 /lib /usr/lib64 /usr/lib `cat /etc/ld.so.conf /etc/ld.so.conf.d/*.conf | grep '^/'`"
+                dirs="$dirs `ldconfig -v 2>/dev/null | grep -v '^\s' | sed 's/^\([^:]*\):.*$/\1/'`"
+            fi
+            if [ -f /etc/ld.so.conf ]; then
+                dirs="$dirs `cat /etc/ld.so.conf | grep '^/'`"
+            fi
+            additional_configs=$(ls /etc/ld.so.conf.d/*.conf 2>&1)
+            if [ $? = 0 ]; then
+                for conf in $additional_configs; do
+                    dirs="$dirs `cat $conf | grep '^/'`"
+                done
             fi
             dirs=`echo $dirs | tr " " ":"`
-            CASSANDRA_LIBJEMALLOC=$(find_library '.*/libjemalloc\.so\(\.1\)*' $dirs)
+            CASSANDRA_LIBJEMALLOC=$(find_library '.*/libjemalloc\.so.*' $dirs)
         fi
         if [ ! -z $CASSANDRA_LIBJEMALLOC ] ; then
             export JVM_OPTS="$JVM_OPTS -Dcassandra.libjemalloc=$CASSANDRA_LIBJEMALLOC"
@@ -189,7 +201,7 @@ launch_service()
     props="$3"
     class="$4"
     cassandra_parms="-Dlogback.configurationFile=logback.xml"
-    cassandra_parms="$cassandra_parms -Dcassandra.logdir=$CASSANDRA_HOME/logs"
+    cassandra_parms="$cassandra_parms -Dcassandra.logdir=$CASSANDRA_LOG_DIR"
     cassandra_parms="$cassandra_parms -Dcassandra.storagedir=$cassandra_storagedir"
 
     if [ "x$pidpath" != "x" ]; then

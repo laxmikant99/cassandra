@@ -437,9 +437,9 @@ public class FBUtilities
         }
     }
 
-    public static void waitOnFutures(List<AsyncOneResponse> results, long ms) throws TimeoutException
+    public static void waitOnFutures(List<AsyncOneResponse<?>> results, long ms) throws TimeoutException
     {
-        for (AsyncOneResponse result : results)
+        for (AsyncOneResponse<?> result : results)
             result.get(ms, TimeUnit.MILLISECONDS);
     }
 
@@ -901,7 +901,7 @@ public class FBUtilities
         updateWithByte(digest, val ? 0 : 1);
     }
 
-    public static void closeAll(List<? extends AutoCloseable> l) throws Exception
+    public static void closeAll(Collection<? extends AutoCloseable> l) throws Exception
     {
         Exception toThrow = null;
         for (AutoCloseable c : l)
@@ -933,6 +933,18 @@ public class FBUtilities
             return baos.toByteArray();
         }
         catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static void sleepQuietly(long millis)
+    {
+        try
+        {
+            Thread.sleep(millis);
+        }
+        catch (InterruptedException e)
         {
             throw new RuntimeException(e);
         }

@@ -18,12 +18,10 @@
 
 package org.apache.cassandra.cql3;
 
-import static org.junit.Assert.*;
-
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import com.google.common.util.concurrent.Uninterruptibles;
@@ -33,11 +31,13 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.exceptions.InvalidQueryException;
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.Util;
 import org.apache.cassandra.concurrent.SEPExecutor;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
@@ -48,16 +48,26 @@ import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.marshal.AsciiType;
-import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.FBUtilities;
+import org.jboss.byteman.contrib.bmunit.BMRule;
+import org.jboss.byteman.contrib.bmunit.BMRules;
+import org.jboss.byteman.contrib.bmunit.BMUnitRunner;
 
+import static junit.framework.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
+@RunWith(BMUnitRunner.class)
 public class ViewTest extends CQLTester
 {
+    /** Latch used by {@link #testTruncateWhileBuilding()} Byteman injections. */
+    @SuppressWarnings("unused")
+    private static final CountDownLatch blockViewBuild = new CountDownLatch(1);
+
     int protocolVersion = 4;
     private final List<String> views = new ArrayList<>();
 
@@ -90,11 +100,13 @@ public class ViewTest extends CQLTester
     private void updateView(String query, Object... params) throws Throwable
     {
         executeNet(protocolVersion, query, params);
-        while (!(((SEPExecutor) StageManager.getStage(Stage.VIEW_MUTATION)).getPendingTasks() == 0
-                && ((SEPExecutor) StageManager.getStage(Stage.VIEW_MUTATION)).getActiveCount() == 0))
-        {
-            Thread.sleep(1);
-        }
+        waitForViewMutations();
+    }
+
+    private void waitForViewMutations()
+    {
+        SEPExecutor executor = (SEPExecutor) StageManager.getStage(Stage.VIEW_MUTATION);
+        Util.spinAssertEquals(0L, () -> executor.getPendingTasks() + executor.getActiveCount(), 60);
     }
 
     @Test
@@ -105,6 +117,25 @@ public class ViewTest extends CQLTester
 
         execute("DROP MATERIALIZED VIEW IF EXISTS " + KEYSPACE + ".view_does_not_exist");
         execute("DROP MATERIALIZED VIEW IF EXISTS keyspace_does_not_exist.view_does_not_exist");
+    }
+
+    @Test
+    public void testNoBatchlogCleanupForLocalMutations() throws Throwable
+    {
+        execute("USE " + keyspace());
+        executeNet(protocolVersion, "USE " + keyspace());
+
+        createTable("CREATE TABLE %s (k1 int primary key, v1 int)");
+        createView("view1", "CREATE MATERIALIZED VIEW view1 AS SELECT * FROM %%s WHERE k1 IS NOT NULL AND v1 IS NOT NULL PRIMARY KEY (v1, k1)");
+
+        ColumnFamilyStore batchlog = Keyspace.open(SystemKeyspace.NAME).getColumnFamilyStore(SystemKeyspace.BATCHES);
+        batchlog.disableAutoCompaction();
+        batchlog.forceBlockingFlush();
+        int batchlogSSTables = batchlog.getLiveSSTables().size();
+
+        updateView("INSERT INTO %s(k1, v1) VALUES(?, ?)", 1, 1);
+        batchlog.forceBlockingFlush();
+        assertEquals(batchlogSSTables, batchlog.getLiveSSTables().size());
     }
 
     @Test
@@ -1389,4 +1420,76 @@ public class ViewTest extends CQLTester
      {
          execute("CREATE MATERIALIZED VIEW myview AS SELECT a, b FROM \"\" WHERE b IS NOT NULL PRIMARY KEY (b, a)");
      }
+
+    @Test
+    public void viewOnCompactTableTest() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, v int, PRIMARY KEY (a, b)) WITH COMPACT STORAGE");
+        executeNet(protocolVersion, "USE " + keyspace());
+        try
+        {
+            createView("mv",
+                       "CREATE MATERIALIZED VIEW %s AS SELECT a, b, value FROM %%s WHERE b IS NOT NULL PRIMARY KEY (b, a)");
+            fail("Should have thrown an exception");
+        }
+        catch (Throwable t)
+        {
+            Assert.assertEquals("Unknown column name detected in CREATE MATERIALIZED VIEW statement : value",
+                                t.getMessage());
+        }
+    }
+
+    /**
+     * Tests that truncating a table stops the ongoing builds of its materialized views,
+     * so they don't write into the MV data that has been truncated in the base table.
+     *
+     * See CASSANDRA-16567 for further details.
+     */
+    @Test
+    @BMRules(rules = {
+    @BMRule(name = "Block view builder",
+    targetClass = "ViewBuilder",
+    targetMethod = "buildKey",
+    action = "com.google.common.util.concurrent.Uninterruptibles.awaitUninterruptibly" +
+             "(org.apache.cassandra.cql3.ViewTest.blockViewBuild);"),
+    @BMRule(name = "Unblock view builder",
+    targetClass = "ColumnFamilyStore",
+    targetMethod = "truncateBlocking",
+    action = "org.apache.cassandra.cql3.ViewTest.blockViewBuild.countDown();")
+    })
+    public void testTruncateWhileBuilding() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, v int, PRIMARY KEY(k, c))");
+        execute("USE " + keyspace());
+        executeNet(protocolVersion, "USE " + keyspace());
+        execute("INSERT INTO %s (k, c, v) VALUES (?, ?, ?)", 0, 0, 0);
+        createView("mv",
+                   "CREATE MATERIALIZED VIEW %s AS SELECT * FROM %%s " +
+                   "WHERE k IS NOT NULL AND c IS NOT NULL AND v IS NOT NULL " +
+                   "PRIMARY KEY (v, c, k)");
+
+        // check that the delayed view builder is either running or pending,
+        // and that it hasn't written anything yet
+        assertThat(runningCompactions()).isPositive();
+        assertFalse(SystemKeyspace.isViewBuilt(KEYSPACE, "mv"));
+        waitForViewMutations();
+        assertRows(execute("SELECT * FROM mv"));
+
+        // truncate the view, this should unblock the view builder, wait for its cancellation,
+        // drop the sstables and, finally, start a new view build
+        updateView("TRUNCATE %s");
+
+        // check that there aren't any rows after truncating
+        assertRows(execute("SELECT * FROM mv"));
+
+        // check that the view builder finishes and that the view is still empty after that
+        Util.spinAssertEquals(true, () -> SystemKeyspace.isViewBuilt(KEYSPACE, "mv"), 60);
+        waitForViewMutations();
+        assertRows(execute("SELECT * FROM mv"));
+    }
+
+    private static int runningCompactions()
+    {
+        return CompactionManager.instance.getPendingTasks() + CompactionManager.instance.getActiveCompactions();
+    }
 }

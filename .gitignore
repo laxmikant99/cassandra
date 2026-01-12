@@ -1,6 +1,7 @@
 .gitignore
 
 # C*
+build
 build/
 src/gen-java/
 src/resources/org/apache/cassandra/config/
@@ -8,6 +9,9 @@ logs/
 data/
 conf/hotspot_compiler
 doc/cql3/CQL.html
+pylib/src/
+pylib/cqlshlib/serverversion.py
+lib/
 
 # C* debs
 build-stamp
@@ -26,7 +30,7 @@ debian/files
 # IntelliJ
 .idea/
 *.eml
-*.iml
+**/*.iml
 *.ipr
 *.iws
 
@@ -52,6 +56,7 @@ out/
 target/
 
 # General
+**/__pycache__
 *.pyc
 *~
 *.bak
@@ -71,3 +76,12 @@ lib/jsr223/jython/*.jar
 lib/jsr223/jython/cachedir
 lib/jsr223/scala/*.jar
 
+/.ant-targets-build.xml
+.ant_targets
+
+# Python virtual environment
+venv/
+
+# build-scripts will put cassandra-builds and cassandra-dtest into the directory
+cassandra-builds/
+cassandra-dtest/

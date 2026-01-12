@@ -18,7 +18,6 @@
 package org.apache.cassandra.cql3.validation.operations;
 
 import java.math.BigDecimal;
-import java.math.MathContext;
 import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.nio.ByteBuffer;
@@ -30,7 +29,6 @@ import java.util.Date;
 import java.util.Locale;
 import java.util.TimeZone;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.stream.DoubleStream;
 
 import org.apache.commons.lang3.time.DateUtils;
 
@@ -40,6 +38,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.classic.joran.ReconfigureOnChangeTask;
 import ch.qos.logback.classic.spi.TurboFilterList;
 import ch.qos.logback.classic.turbo.ReconfigureOnChangeFilter;
 import ch.qos.logback.classic.turbo.TurboFilter;
@@ -51,16 +50,18 @@ import org.apache.cassandra.cql3.UntypedResultSet.Row;
 import org.apache.cassandra.cql3.functions.UDAggregate;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.DynamicCompositeType;
 import org.apache.cassandra.db.marshal.TypeParser;
 import org.apache.cassandra.exceptions.FunctionExecutionException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.transport.Event;
 import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.transport.Event.SchemaChange.Change;
+import org.apache.cassandra.transport.Event.SchemaChange.Target;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
+import static ch.qos.logback.core.CoreConstants.RECONFIGURE_ON_CHANGE_TASK;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
@@ -429,42 +430,40 @@ public class AggregationTest extends CQLTester
                                "LANGUAGE javascript " +
                                "AS '\"string\";';");
 
-        String a = createAggregate(KEYSPACE,
-                                   "double",
-                                   "CREATE OR REPLACE AGGREGATE %s(double) " +
-                                   "SFUNC " + shortFunctionName(f) + " " +
-                                   "STYPE double " +
-                                   "INITCOND 0");
+        String a = createAggregateName(KEYSPACE);
+        String aggregateName = shortFunctionName(a);
+        registerAggregate(a, "double");
 
-        assertLastSchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.AGGREGATE,
-                               KEYSPACE, parseFunctionName(a).name,
-                               "double");
+        assertSchemaChange("CREATE OR REPLACE AGGREGATE " + a + "(double) " +
+                           "SFUNC " + shortFunctionName(f) + " " +
+                           "STYPE double " +
+                           "INITCOND 0",
+                           Change.CREATED, Target.AGGREGATE,
+                           KEYSPACE, aggregateName,
+                           "double");
 
-        schemaChange("CREATE OR REPLACE AGGREGATE " + a + "(double) " +
-                     "SFUNC " + shortFunctionName(f) + " " +
-                     "STYPE double " +
-                     "INITCOND 0");
+        assertSchemaChange("CREATE OR REPLACE AGGREGATE " + a + "(double) " +
+                           "SFUNC " + shortFunctionName(f) + " " +
+                           "STYPE double " +
+                           "INITCOND 1",
+                           Change.UPDATED, Target.AGGREGATE,
+                           KEYSPACE, aggregateName,
+                           "double");
 
-        assertLastSchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.AGGREGATE,
-                               KEYSPACE, parseFunctionName(a).name,
-                               "double");
+        registerAggregate(a, "int");
 
-        createAggregateOverload(a,
-                                "int",
-                                "CREATE OR REPLACE AGGREGATE %s(int) " +
-                                "SFUNC " + shortFunctionName(f) + " " +
-                                "STYPE int " +
-                                "INITCOND 0");
+        assertSchemaChange("CREATE OR REPLACE AGGREGATE " + a + "(int) " +
+                           "SFUNC " + shortFunctionName(f) + " " +
+                           "STYPE int " +
+                           "INITCOND 0",
+                           Change.CREATED, Target.AGGREGATE,
+                           KEYSPACE, aggregateName,
+                           "int");
 
-        assertLastSchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.AGGREGATE,
-                               KEYSPACE, parseFunctionName(a).name,
-                               "int");
-
-        schemaChange("DROP AGGREGATE " + a + "(double)");
-
-        assertLastSchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.AGGREGATE,
-                               KEYSPACE, parseFunctionName(a).name,
-                               "double");
+        assertSchemaChange("DROP AGGREGATE " + a + "(double)",
+                           Change.DROPPED, Target.AGGREGATE,
+                           KEYSPACE, aggregateName,
+                           "double");
     }
 
     @Test
@@ -1125,7 +1124,7 @@ public class AggregationTest extends CQLTester
                                        "SFUNC " + shortFunctionName(fState) + " " +
                                        "STYPE int");
 
-            ResultMessage.Prepared prepared = QueryProcessor.prepare("SELECT " + a + "(b) FROM " + otherKS + ".jsdp", ClientState.forInternalCalls(), false);
+            ResultMessage.Prepared prepared = QueryProcessor.instance.prepare("SELECT " + a + "(b) FROM " + otherKS + ".jsdp", ClientState.forInternalCalls(), false);
             assertNotNull(QueryProcessor.instance.getPrepared(prepared.statementId));
 
             execute("DROP AGGREGATE " + a + "(int)");
@@ -1137,7 +1136,7 @@ public class AggregationTest extends CQLTester
                     "SFUNC " + shortFunctionName(fState) + " " +
                     "STYPE int");
 
-            prepared = QueryProcessor.prepare("SELECT " + a + "(b) FROM " + otherKS + ".jsdp", ClientState.forInternalCalls(), false);
+            prepared = QueryProcessor.instance.prepare("SELECT " + a + "(b) FROM " + otherKS + ".jsdp", ClientState.forInternalCalls(), false);
             assertNotNull(QueryProcessor.instance.getPrepared(prepared.statementId));
 
             execute("DROP KEYSPACE " + otherKS + ";");
@@ -1875,6 +1874,16 @@ public class AggregationTest extends CQLTester
                 break;
             }
         }
+
+        ReconfigureOnChangeTask roct = (ReconfigureOnChangeTask) ctx.getObject(RECONFIGURE_ON_CHANGE_TASK);
+        if (roct != null)
+        {
+            // New functionality in logback - they replaced ReconfigureOnChangeFilter (which runs in the logging code)
+            // with an async ReconfigureOnChangeTask - i.e. in a thread that does not become sandboxed.
+            // Let the test run anyway, just we cannot reconfigure it (and it is pointless to reconfigure).
+            return;
+        }
+
         assertTrue("ReconfigureOnChangeFilter not in logback's turbo-filter list - do that by adding scan=\"true\" to logback-test.xml's configuration element", done);
     }
 
@@ -2126,5 +2135,21 @@ public class AggregationTest extends CQLTester
 
         for (int i = 1; i <= 17; i++)
             execute("insert into %s (bucket, v1, v2, v3) values (?, ?, ?, ?)", i, (float) (i / 10.0), i / 10.0, BigDecimal.valueOf(i / 10.0));
+    }
+
+    @Test
+    public void testRejectInvalidAggregateNamesOnCreation()
+    {
+        for (String funcName : Arrays.asList("my/fancy/aggregate", "my_other[fancy]aggregate"))
+        {
+            assertThatThrownBy(() -> {
+                createAggregateOverload(String.format("%s.\"%s\"", KEYSPACE_PER_TEST, funcName), "int",
+                                        " CREATE AGGREGATE IF NOT EXISTS %s(text, text)\n" +
+                                        " SFUNC func\n" +
+                                        " STYPE map<text,bigint>\n" +
+                                        " INITCOND { };");
+            }).hasRootCauseInstanceOf(InvalidRequestException.class)
+              .hasRootCauseMessage("Aggregate name '%s' is invalid", funcName);
+        }
     }
 }

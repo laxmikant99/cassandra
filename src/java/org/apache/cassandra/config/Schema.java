@@ -125,6 +125,12 @@ public class Schema
         return REPLICATED_SYSTEM_KEYSPACE_NAMES.contains(keyspaceName.toLowerCase());
     }
 
+    public static boolean isSystemKeyspace(String keyspaceName)
+    {
+        final String lowercaseKeyspaceName = keyspaceName.toLowerCase();
+        return LOCAL_SYSTEM_KEYSPACE_NAMES.contains(lowercaseKeyspaceName)
+               || REPLICATED_SYSTEM_KEYSPACE_NAMES.contains(lowercaseKeyspaceName);
+    }
     /**
      * load keyspace (keyspace) definitions, but do not initialize the keyspace instances.
      * Schema version may be updated as the result.
@@ -574,6 +580,14 @@ public class Schema
     }
 
     /**
+     * Checks whether the current schema is empty.
+     */
+    public boolean isEmpty()
+    {
+        return emptyVersion.equals(version);
+    }
+
+    /**
      * Read schema from system keyspace and calculate MD5 digest of every row, resulting digest
      * will be converted into UUID which would act as content-based version of the schema.
      */
@@ -750,6 +764,11 @@ public class Schema
         // make sure all the indexes are dropped, or else.
         cfs.indexManager.markAllIndexesRemoved();
 
+        CompactionManager.instance.interruptCompactionFor(Collections.singleton(cfs.metadata), true);
+
+        if (DatabaseDescriptor.isAutoSnapshot())
+            cfs.snapshot(Keyspace.getTimestampedSnapshotName(cfs.name));
+
         // reinitialize the keyspace.
         ViewDefinition view = oldKsm.views.get(viewName).get();
         KeyspaceMetadata newKsm = oldKsm.withSwapped(oldKsm.views.without(viewName));
@@ -757,10 +776,6 @@ public class Schema
         unload(view);
         setKeyspaceMetadata(newKsm);
 
-        CompactionManager.instance.interruptCompactionFor(Collections.singleton(view.metadata), true);
-
-        if (DatabaseDescriptor.isAutoSnapshot())
-            cfs.snapshot(Keyspace.getTimestampedSnapshotName(cfs.name));
         Keyspace.open(ksName).dropCf(view.metadata.cfId);
         Keyspace.open(ksName).viewManager.reload();
         MigrationManager.instance.notifyDropView(view);

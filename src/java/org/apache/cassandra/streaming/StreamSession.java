@@ -152,12 +152,27 @@ public class StreamSession implements IEndpointStateChangeSubscriber
 
     public static enum State
     {
-        INITIALIZED,
-        PREPARING,
-        STREAMING,
-        WAIT_COMPLETE,
-        COMPLETE,
-        FAILED,
+        INITIALIZED(false),
+        PREPARING(false),
+        STREAMING(false),
+        WAIT_COMPLETE(false),
+        COMPLETE(true),
+        FAILED(true);
+
+        private final boolean finalState;
+
+        State(boolean finalState)
+        {
+            this.finalState = finalState;
+        }
+
+        /**
+         * @return true if current state is final, either COMPLETE OR FAILED.
+         */
+        public boolean isFinalState()
+        {
+            return finalState;
+        }
     }
 
     private volatile State state = State.INITIALIZED;
@@ -300,7 +315,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
 
     private void failIfFinished()
     {
-        if (state() == State.COMPLETE || state() == State.FAILED)
+        if (state().isFinalState())
             throw new RuntimeException(String.format("Stream %s is finished with state %s", planId(), state().name()));
     }
 
@@ -665,12 +680,6 @@ public class StreamSession implements IEndpointStateChangeSubscriber
         transfers.remove(completedTask.cfId);
         maybeCompleted();
     }
-
-    public void onJoin(InetAddress endpoint, EndpointState epState) {}
-    public void beforeChange(InetAddress endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue) {}
-    public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value) {}
-    public void onAlive(InetAddress endpoint, EndpointState state) {}
-    public void onDead(InetAddress endpoint, EndpointState state) {}
 
     public void onRemove(InetAddress endpoint)
     {

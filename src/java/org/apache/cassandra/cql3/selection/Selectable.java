@@ -77,7 +77,7 @@ public abstract class Selectable
         public Selector.Factory newSelectorFactory(CFMetaData cfm,
                                                    List<ColumnDefinition> defs) throws InvalidRequestException
         {
-            ColumnDefinition def = cfm.getColumnDefinition(id);
+            ColumnDefinition def = cfm.getColumnDefinitionForCQL(id);
             if (def == null)
                 throw new InvalidRequestException(String.format("Undefined name %s in selection clause", id));
             if (def.isPrimaryKeyColumn())
@@ -85,9 +85,10 @@ public abstract class Selectable
                         String.format("Cannot use selection function %s on PRIMARY KEY part %s",
                                       isWritetime ? "writeTime" : "ttl",
                                       def.name));
-            if (def.type.isCollection())
-                throw new InvalidRequestException(String.format("Cannot use selection function %s on collections",
-                                                                isWritetime ? "writeTime" : "ttl"));
+            if (def.type.isMultiCell())
+                throw new InvalidRequestException(String.format("Cannot use selection function %s on non-frozen collection %s",
+                                                                isWritetime ? "writeTime" : "ttl",
+                                                                def.name));
 
             return WritetimeOrTTLSelector.newFactory(def, addAndGetIndex(def, defs), isWritetime);
         }

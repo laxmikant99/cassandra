@@ -22,6 +22,7 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.Map;
@@ -37,13 +38,17 @@ import org.apache.cassandra.db.commitlog.ReplayPosition;
 import org.apache.cassandra.dht.RandomPartitioner;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.io.util.BufferedDataOutputStreamPlus;
 import org.apache.cassandra.io.util.DataOutputStreamPlus;
 import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.utils.Throwables;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 public class MetadataSerializerTest
 {
@@ -64,6 +69,33 @@ public class MetadataSerializerTest
             {
                 assertEquals(originalMetadata.get(type), deserialized.get(type));
             }
+        }
+    }
+
+    @Test
+    public void testHistogramSterilization() throws IOException
+    {
+        Map<MetadataType, MetadataComponent> originalMetadata = constructMetadata();
+
+        // Modify the histograms to overflow:
+        StatsMetadata originalStats = (StatsMetadata) originalMetadata.get(MetadataType.STATS);
+        originalStats.estimatedColumnCount.add(Long.MAX_VALUE);
+        originalStats.estimatedPartitionSize.add(Long.MAX_VALUE);
+        assertTrue(originalStats.estimatedColumnCount.isOverflowed());
+        assertTrue(originalStats.estimatedPartitionSize.isOverflowed());
+
+        // Serialize w/ overflowed histograms:
+        MetadataSerializer serializer = new MetadataSerializer();
+        File statsFile = serialize(originalMetadata, serializer, BigFormat.latestVersion);
+        Descriptor desc = new Descriptor(statsFile.getParentFile(), "", "", 0, SSTableFormat.Type.BIG);
+
+        try (RandomAccessReader in = RandomAccessReader.open(statsFile))
+        {
+            // Deserialie and verify that the two histograms have had their overflow buckets cleared:
+            Map<MetadataType, MetadataComponent> deserialized = serializer.deserialize(desc, in, EnumSet.allOf(MetadataType.class));
+            StatsMetadata deserializedStats = (StatsMetadata)deserialized.get(MetadataType.STATS);
+            assertFalse(deserializedStats.estimatedColumnCount.isOverflowed());
+            assertFalse(deserializedStats.estimatedPartitionSize.isOverflowed());
         }
     }
 
@@ -94,28 +126,51 @@ public class MetadataSerializerTest
         return originalMetadata;
     }
 
-    @Test
-    public void testLaReadLb() throws IOException
+    private void testVersions(String... versions) throws Throwable
     {
-        testOldReadsNew("la", "lb");
+        Throwable t = null;
+        for (int oldIdx = 0; oldIdx < versions.length; oldIdx++)
+        {
+            for (int newIdx = oldIdx; newIdx < versions.length; newIdx++)
+            {
+                try
+                {
+                    testOldReadsNew(versions[oldIdx], versions[newIdx]);
+                }
+                catch (Exception | AssertionError e)
+                {
+                    t = Throwables.merge(t, new AssertionError("Failed to test " + versions[oldIdx] + " -> " + versions[newIdx], e));
+                }
+            }
+        }
+        if (t != null)
+        {
+            throw t;
+        }
     }
 
     @Test
-    public void testMaReadMb() throws IOException
+    public void testJVersions() throws Throwable
     {
-        testOldReadsNew("ma", "mb");
+        testVersions("jb");
     }
 
     @Test
-    public void testMaReadMc() throws IOException
+    public void testKVersions() throws Throwable
     {
-        testOldReadsNew("ma", "mc");
+        testVersions("ka");
     }
 
     @Test
-    public void testMbReadMc() throws IOException
+    public void testLVersions() throws Throwable
     {
-        testOldReadsNew("mb", "mc");
+        testVersions("la", "lb");
+    }
+
+    @Test
+    public void testMVersions() throws Throwable
+    {
+        testVersions("ma", "mb", "mc", "md", "me");
     }
 
     public void testOldReadsNew(String oldV, String newV) throws IOException
@@ -144,5 +199,12 @@ public class MetadataSerializerTest
                 }
             }
         }
+    }
+
+    @Test
+    public void originatingHostCompatibility()
+    {
+        Arrays.asList("ma", "mb", "mc", "md").forEach(v -> assertFalse(BigFormat.instance.getVersion(v).hasOriginatingHostId()));
+        Arrays.asList("me").forEach(v -> assertTrue(BigFormat.instance.getVersion(v).hasOriginatingHostId()));
     }
 }

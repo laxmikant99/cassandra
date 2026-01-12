@@ -76,19 +76,19 @@ public abstract class UDFunction extends AbstractFunction implements ScalarFunct
     protected final boolean calledOnNullInput;
 
     //
-    // Access to classes is controlled via a whitelist and a blacklist.
+    // Access to classes is controlled via allow and disallow lists.
     //
     // When a class is requested (both during compilation and runtime),
-    // the whitelistedPatterns array is searched first, whether the
+    // the allowedPatterns array is searched first, whether the
     // requested name matches one of the patterns. If not, nothing is
     // returned from the class-loader - meaning ClassNotFoundException
     // during runtime and "type could not resolved" during compilation.
     //
-    // If a whitelisted pattern has been found, the blacklistedPatterns
+    // If an allowed pattern has been found, the disallowedPatterns
     // array is searched for a match. If a match is found, class-loader
     // rejects access. Otherwise the class/resource can be loaded.
     //
-    private static final String[] whitelistedPatterns =
+    private static final String[] allowedPatterns =
     {
     "com/datastax/driver/core/",
     "com/google/common/reflect/TypeToken",
@@ -110,8 +110,8 @@ public abstract class UDFunction extends AbstractFunction implements ScalarFunct
     "org/apache/cassandra/cql3/functions/JavaUDF.class",
     "org/apache/cassandra/exceptions/",
     };
-    // Only need to blacklist a pattern, if it would otherwise be allowed via whitelistedPatterns
-    private static final String[] blacklistedPatterns =
+    // Only need to disallow a pattern, if it would otherwise be allowed via allowedPatterns
+    private static final String[] disallowedPatterns =
     {
     "com/datastax/driver/core/Cluster.class",
     "com/datastax/driver/core/Metrics.class",
@@ -149,22 +149,39 @@ public abstract class UDFunction extends AbstractFunction implements ScalarFunct
     "java/util/zip/",
     };
 
+    private static final String[] disallowedPatternsSyncUDF =
+    {
+    "java/lang/System.class"
+    };
+
     static boolean secureResource(String resource)
     {
         while (resource.startsWith("/"))
             resource = resource.substring(1);
 
-        for (String white : whitelistedPatterns)
-            if (resource.startsWith(white))
+        for (String allowed : allowedPatterns)
+            if (resource.startsWith(allowed))
             {
-
-                // resource is in whitelistedPatterns, let's see if it is not explicityl blacklisted
-                for (String black : blacklistedPatterns)
-                    if (resource.startsWith(black))
+                // resource is in allowedPatterns, let's see if it is not explicitly disallowed
+                for (String disallowed : disallowedPatterns)
+                {
+                    if (resource.startsWith(disallowed))
                     {
                         logger.trace("access denied: resource {}", resource);
                         return false;
                     }
+                }
+                if (!DatabaseDescriptor.enableUserDefinedFunctionsThreads() && !DatabaseDescriptor.allowExtraInsecureUDFs())
+                {
+                    for (String disallowed : disallowedPatternsSyncUDF)
+                    {
+                        if (resource.startsWith(disallowed))
+                        {
+                            logger.trace("access denied: resource {}", resource);
+                            return false;
+                        }
+                    }
+                }
 
                 return true;
             }
@@ -173,7 +190,7 @@ public abstract class UDFunction extends AbstractFunction implements ScalarFunct
         return false;
     }
 
-    // setup the UDF class loader with no parent class loader so that we have full control about what class/resource UDF uses
+    // setup the UDF class loader with a context class loader as a parent so that we have full control about what class/resource UDF uses
     static final ClassLoader udfClassLoader = new UDFClassLoader();
 
     protected UDFunction(FunctionName name,
@@ -560,6 +577,11 @@ public abstract class UDFunction extends AbstractFunction implements ScalarFunct
     {
         // insecureClassLoader is the C* class loader
         static final ClassLoader insecureClassLoader = Thread.currentThread().getContextClassLoader();
+
+        private UDFClassLoader()
+        {
+            super(insecureClassLoader);
+        }
 
         public URL getResource(String name)
         {
