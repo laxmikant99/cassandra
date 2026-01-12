@@ -26,6 +26,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +36,7 @@ import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.MarshalException;
@@ -153,7 +155,7 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
      */
     public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
-        return '"' + getSerializer().deserialize(buffer).toString() + '"';
+        return '"' + Objects.toString(getSerializer().deserialize(buffer), "") + '"';
     }
 
     /* validate that the byte array is a valid sequence for the type we are supposed to be comparing */
@@ -281,9 +283,11 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
      *
      * Note that a type should be compatible with at least itself.
      */
-    public boolean isValueCompatibleWith(AbstractType<?> otherType)
+    public boolean isValueCompatibleWith(AbstractType<?> previous)
     {
-        return isValueCompatibleWithInternal((otherType instanceof ReversedType) ? ((ReversedType) otherType).baseType : otherType);
+        AbstractType<?> thisType =          isReversed() ? ((ReversedType<?>)     this).baseType : this;
+        AbstractType<?> thatType = previous.isReversed() ? ((ReversedType<?>) previous).baseType : previous;
+        return thisType.isValueCompatibleWithInternal(thatType);
     }
 
     /**
@@ -293,6 +297,18 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
     protected boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
     {
         return isCompatibleWith(otherType);
+    }
+
+    /**
+     * Similar to {@link #isValueCompatibleWith(AbstractType)}, but takes into account {@link Cell} encoding.
+     * In particular, this method doesn't consider two types serialization compatible if one of them has fixed
+     * length (overrides {@link #valueLengthIfFixed()}, and the other one doesn't.
+     */
+    public boolean isSerializationCompatibleWith(AbstractType<?> previous)
+    {
+        return isValueCompatibleWith(previous)
+               && valueLengthIfFixed() == previous.valueLengthIfFixed()
+               && isMultiCell() == previous.isMultiCell();
     }
 
     /**
@@ -403,11 +419,23 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
         return -1;
     }
 
+    public void validateIfFixedSize(ByteBuffer value)
+    {
+        if (valueLengthIfFixed() < 0)
+            return;
+
+        validate(value);
+    }
+
     // This assumes that no empty values are passed
     public void writeValue(ByteBuffer value, DataOutputPlus out) throws IOException
     {
         assert value.hasRemaining();
-        if (valueLengthIfFixed() >= 0)
+        int valueLengthIfFixed = valueLengthIfFixed();
+        assert valueLengthIfFixed < 0 || value.remaining() == valueLengthIfFixed : String.format("Expected exactly %d bytes, but was %d",
+                                                                                                 valueLengthIfFixed, value.remaining());
+
+        if (valueLengthIfFixed >= 0)
             out.write(value);
         else
             ByteBufferUtil.writeWithVIntLength(value, out);
@@ -416,7 +444,11 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
     public long writtenLength(ByteBuffer value)
     {
         assert value.hasRemaining();
-        return valueLengthIfFixed() >= 0
+        int valueLengthIfFixed = valueLengthIfFixed();
+        assert valueLengthIfFixed < 0 || value.remaining() == valueLengthIfFixed : String.format("Expected exactly %d bytes, but was %d",
+                                                                                                 valueLengthIfFixed, value.remaining());
+
+        return valueLengthIfFixed >= 0
              ? value.remaining()
              : TypeSizes.sizeofWithVIntLength(value);
     }

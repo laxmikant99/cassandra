@@ -78,7 +78,7 @@ public class Config
 
     /* initial token in the ring */
     public String initial_token;
-    public int num_tokens = 1;
+    public Integer num_tokens;
     /** Triggers automatic allocation of tokens if set, using the replication strategy of the referenced keyspace */
     public String allocate_tokens_for_keyspace = null;
 
@@ -161,6 +161,9 @@ public class Config
     public volatile long native_transport_max_concurrent_connections = -1L;
     public volatile long native_transport_max_concurrent_connections_per_ip = -1L;
     public boolean native_transport_flush_in_batches_legacy = true;
+    public volatile long native_transport_max_concurrent_requests_in_bytes_per_ip = -1L;
+    public volatile long native_transport_max_concurrent_requests_in_bytes = -1L;
+    public Integer native_transport_max_negotiable_protocol_version = Integer.MIN_VALUE;
 
     @Deprecated
     public int thrift_max_message_length_in_mb = 16;
@@ -266,6 +269,8 @@ public class Config
     public volatile int counter_cache_save_period = 7200;
     public volatile int counter_cache_keys_to_save = Integer.MAX_VALUE;
 
+    public int cache_load_timeout_seconds = 30;
+
     private static boolean isClientMode = false;
     private static Supplier<Config> overrideLoadConfig = null;
 
@@ -296,6 +301,8 @@ public class Config
 
     public volatile int tombstone_warn_threshold = 1000;
     public volatile int tombstone_failure_threshold = 100000;
+
+    public final ReplicaFilteringProtectionOptions replica_filtering_protection = new ReplicaFilteringProtectionOptions();
 
     public volatile Long index_summary_capacity_in_mb;
     public volatile int index_summary_resize_interval_in_minutes = 60;
@@ -350,6 +357,8 @@ public class Config
 
     public boolean enable_sasi_indexes = true;
 
+    public volatile boolean enable_drop_compact_storage = false;
+
     /**
      * Optionally disable asynchronous UDF execution.
      * Disabling asynchronous UDF execution also implicitly disables the security-manager!
@@ -358,8 +367,21 @@ public class Config
      * "tell" a user that there's something really wrong with the UDF.
      * When you disable async UDF execution, users MUST pay attention to read-timeouts since these may indicate
      * UDFs that run too long or forever - and this can destabilize the cluster.
+     *
+     * This requires allow_insecure_udfs to be true
      */
     public boolean enable_user_defined_functions_threads = true;
+
+    /**
+     * Set this to true to allow running insecure UDFs.
+     */
+    public boolean allow_insecure_udfs = false;
+
+    /**
+     * Set this to allow UDFs accessing java.lang.System.* methods, which basically allows UDFs to execute any arbitrary code on the system.
+     */
+    public boolean allow_extra_insecure_udfs = false;
+
     /**
      * Time in milliseconds after a warning will be emitted to the log and to the client that a UDF runs too long.
      * (Only valid, if enable_user_defined_functions_threads==true)
@@ -393,6 +415,25 @@ public class Config
         return isClientMode;
     }
 
+    /**
+     * If true, when rows with duplicate clustering keys are detected during a read or compaction
+     * a snapshot will be taken. In the read case, each a snapshot request will be issued to each
+     * replica involved in the query, for compaction the snapshot will be created locally.
+     * These are limited at the replica level so that only a single snapshot per-day can be taken
+     * via this method.
+     *
+     * This requires check_for_duplicate_rows_during_reads and/or check_for_duplicate_rows_during_compaction
+     * below to be enabled
+     */
+    public volatile boolean snapshot_on_duplicate_row_detection = false;
+    /**
+     * If these are enabled duplicate keys will get logged, and if snapshot_on_duplicate_row_detection
+     * is enabled, the table will get snapshotted for offline investigation
+     */
+    public volatile boolean check_for_duplicate_rows_during_reads = true;
+    public volatile boolean check_for_duplicate_rows_during_compaction = true;
+
+    public volatile boolean force_new_prepared_statement_behaviour = false;
     /**
      * Client mode means that the process is a pure client, that uses C* code base but does
      * not read or write local C* database files.
@@ -479,6 +520,7 @@ public class Config
     private static final List<String> SENSITIVE_KEYS = new ArrayList<String>() {{
         add("client_encryption_options");
         add("server_encryption_options");
+        add("encryption_options");
     }};
 
     public static void log(Config config)

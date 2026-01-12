@@ -49,7 +49,12 @@ public interface ColumnFamilyStoreMBean
     public void forceMajorCompaction(boolean splitOutput) throws ExecutionException, InterruptedException;
 
     /**
-     * force a major compaction of specified key range in this column family
+     * Forces a major compaction of specified token ranges in this column family.
+     * <p>
+     * The token ranges will be interpreted as closed intervals to match the closed interval defined by the first and
+     * last keys of a sstable, even though the {@link Range} class is suppossed to be half-open by definition.
+     *
+     * @param tokenRanges The token ranges to be compacted, interpreted as closed intervals.
      */
     public void forceCompactionForTokenRange(Collection<Range<Token>> tokenRanges) throws ExecutionException, InterruptedException;
     /**
@@ -101,12 +106,14 @@ public interface ColumnFamilyStoreMBean
      * Get the compression parameters
      */
     public Map<String,String> getCompressionParameters();
+    public String getCompressionParametersJson();
 
     /**
      * Set the compression parameters
      * @param opts map of string names to values
      */
     public void setCompressionParameters(Map<String,String> opts);
+    public void setCompressionParametersJson(String opts);
 
     /**
      * Set new crc check chance

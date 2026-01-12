@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 
@@ -96,6 +97,11 @@ public interface StorageServiceMBean extends NotificationEmitter
      */
     public String getSchemaVersion();
 
+    /**
+     * Fetch the replication factor for a given keyspace.
+     * @return string representation of replication information
+     */
+    public String getKeyspaceReplicationInfo(String keyspaceName);
 
     /**
      * Get the list of all data file locations from conf
@@ -259,8 +265,14 @@ public interface StorageServiceMBean extends NotificationEmitter
     @Deprecated
     public int relocateSSTables(String keyspace, String ... cfnames) throws IOException, ExecutionException, InterruptedException;
     public int relocateSSTables(int jobs, String keyspace, String ... cfnames) throws IOException, ExecutionException, InterruptedException;
+
     /**
-     * Forces major compaction of specified token range in a single keyspace
+     * Forces major compaction of specified token range in a single keyspace.
+     *
+     * @param keyspaceName the name of the keyspace to be compacted
+     * @param startToken the token at which the compaction range starts (inclusive)
+     * @param endToken the token at which compaction range ends (inclusive)
+     * @param tableNames the names of the tables to be compacted
      */
     public void forceKeyspaceCompactionForTokenRange(String keyspaceName, String startToken, String endToken, String... tableNames) throws IOException, ExecutionException, InterruptedException;
 
@@ -678,6 +690,18 @@ public interface StorageServiceMBean extends NotificationEmitter
     /** Sets the threshold for abandoning queries with many tombstones */
     public void setTombstoneFailureThreshold(int tombstoneDebugThreshold);
 
+    /** Returns the number of rows cached at the coordinator before filtering/index queries log a warning. */
+    public int getCachedReplicaRowsWarnThreshold();
+
+    /** Sets the number of rows cached at the coordinator before filtering/index queries log a warning. */
+    public void setCachedReplicaRowsWarnThreshold(int threshold);
+
+    /** Returns the number of rows cached at the coordinator before filtering/index queries fail outright. */
+    public int getCachedReplicaRowsFailThreshold();
+
+    /** Sets the number of rows cached at the coordinator before filtering/index queries fail outright. */
+    public void setCachedReplicaRowsFailThreshold(int threshold);
+
     /** Returns the threshold for rejecting queries due to a large batch size */
     public int getBatchSizeFailureThreshold();
     /** Sets the threshold for rejecting queries due to a large batch size */
@@ -693,4 +717,10 @@ public interface StorageServiceMBean extends NotificationEmitter
      * @return true if the node successfully starts resuming. (this does not mean bootstrap streaming was success.)
      */
     public boolean resumeBootstrap();
+
+    /** Returns the max version that this node will negotiate for native protocol connections */
+    public int getMaxNativeProtocolVersion();
+
+    /** Returns a map of schema version -> list of endpoints reporting that version that we need schema updates for */
+    public Map<String, Set<InetAddress>> getOutstandingSchemaVersions();
 }

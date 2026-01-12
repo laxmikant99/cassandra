@@ -59,7 +59,7 @@ public class TableStatsPrinter
                 List<StatsTable> tables = keyspace.tables;
                 for (StatsTable table : tables)
                 {
-                    out.println("\t\tTable" + (table.isIndex ? " (index): " + table.name : ": ") + table.name);
+                    out.println("\t\tTable" + (table.isIndex ? " (index): " : ": ") + table.name);
                     out.println("\t\tSSTable count: " + table.sstableCount);
                     if (table.isLeveledSstable)
                         out.println("\t\tSSTables in each level: [" + String.join(", ",
@@ -79,6 +79,7 @@ public class TableStatsPrinter
                     if (table.memtableOffHeapUsed)
                         out.println("\t\tMemtable off heap memory used: " + table.memtableOffHeapMemoryUsed);
                     out.println("\t\tMemtable switch count: " + table.memtableSwitchCount);
+                    out.println("\t\tSpeculative retries: " + table.speculativeRetries);
                     out.println("\t\tLocal read count: " + table.localReadCount);
                     out.printf("\t\tLocal read latency: %01.3f ms%n", table.localReadLatencyMs);
                     out.println("\t\tLocal write count: " + table.localWriteCount);

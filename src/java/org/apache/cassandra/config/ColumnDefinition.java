@@ -141,6 +141,11 @@ public class ColumnDefinition extends ColumnSpecification implements Selectable,
         return new ColumnDefinition(cfm, name, type, NO_POSITION, Kind.STATIC);
     }
 
+    public static ColumnDefinition staticDef(String ksName, String cfName, String name, AbstractType<?> type)
+    {
+        return new ColumnDefinition(ksName, cfName, ColumnIdentifier.getInterned(name, true), type, NO_POSITION, Kind.STATIC);
+    }
+
     public ColumnDefinition(CFMetaData cfm, ByteBuffer name, AbstractType<?> type, int position, Kind kind)
     {
         this(cfm.ksName,
@@ -594,7 +599,7 @@ public class ColumnDefinition extends ColumnSpecification implements Selectable,
 
             private ColumnDefinition find(ByteBuffer id, CFMetaData cfm)
             {
-                ColumnDefinition def = cfm.getColumnDefinition(id);
+                ColumnDefinition def = cfm.getColumnDefinitionForCQL(id);
                 if (def == null)
                     throw new InvalidRequestException(String.format("Undefined column name %s", toString()));
                 return def;

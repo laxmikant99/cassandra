@@ -78,6 +78,9 @@ public final class CreateFunctionStatement extends SchemaAlteringStatement
 
     public Prepared prepare(ClientState clientState) throws InvalidRequestException
     {
+        if (!FunctionName.isNameValid(functionName.name))
+            throw new InvalidRequestException(String.format("Function name '%s' is invalid", functionName.name));
+
         if (new HashSet<>(argNames).size() != argNames.size())
             throw new InvalidRequestException(String.format("duplicate argument names for given function %s with argument names %s",
                                                             functionName, argNames));
@@ -170,7 +173,7 @@ public final class CreateFunctionStatement extends SchemaAlteringStatement
 
     private AbstractType<?> prepareType(String typeName, CQL3Type.Raw rawType)
     {
-        if (rawType.isFrozen())
+        if (!rawType.isTuple() && rawType.isFrozen())
             throw new InvalidRequestException(String.format("The function %s should not be frozen; remove the frozen<> modifier", typeName));
 
         // UDT are not supported non frozen but we do not allow the frozen keyword for argument. So for the moment we

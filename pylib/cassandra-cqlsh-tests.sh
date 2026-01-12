@@ -1,4 +1,21 @@
 #!/bin/bash -x
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 ################################
 #
@@ -22,6 +39,7 @@ export CCM_HEAP_NEWSIZE="200M"
 export CCM_CONFIG_DIR=${WORKSPACE}/.ccm
 export NUM_TOKENS="32"
 export CASSANDRA_DIR=${WORKSPACE}
+export TESTSUITE_NAME="cqlshlib.python2.jdk8"
 
 # Loop to prevent failure due to maven-ant-tasks not downloading a jar..
 for x in $(seq 1 3); do
@@ -39,15 +57,21 @@ fi
 
 # Set up venv with dtest dependencies
 set -e # enable immediate exit if venv setup fails
-virtualenv --python=python2 --no-site-packages venv
+virtualenv --python=python2 venv
 source venv/bin/activate
+# install pip for python2 like this, if it is not already installed
+# curl -sS https://bootstrap.pypa.io/pip/2.7/get-pip.py | python2
+pip install 'pip<21' 'setuptools<45' 'wheel<0.35' 'pbr<6'
 pip install -r ${CASSANDRA_DIR}/pylib/requirements.txt
 pip freeze
 
 if [ "$cython" = "yes" ]; then
-    pip install "Cython>=0.20,<0.25"
+    TESTSUITE_NAME="${TESTSUITE_NAME}.cython"
+    pip install "Cython>=0.27.2,<0.28"
     cd pylib/; python setup.py build_ext --inplace
     cd ${WORKSPACE}
+else
+    TESTSUITE_NAME="${TESTSUITE_NAME}.no_cython"
 fi
 
 ################################
@@ -85,6 +109,9 @@ set +e # disable immediate exit from this point
 nosetests
 
 ccm remove
+# hack around --xunit-prefix-with-testsuite-name not being available in nose 1.3.7
+sed -i "s/testsuite name=\"nosetests\"/testsuite name=\"${TESTSUITE_NAME}\"/g" nosetests.xml
+sed -i "s/testcase classname=\"cqlshlib./testcase classname=\"${TESTSUITE_NAME}./g" nosetests.xml
 mv nosetests.xml ${WORKSPACE}/cqlshlib.xml
 
 ################################

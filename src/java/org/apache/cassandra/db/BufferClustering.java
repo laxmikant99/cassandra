@@ -19,6 +19,10 @@ package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
 
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.utils.ByteBufferUtil;
+
 /**
  * The clustering column values for a row.
  * <p>
@@ -33,8 +37,15 @@ import java.nio.ByteBuffer;
  */
 public class BufferClustering extends AbstractBufferClusteringPrefix implements Clustering
 {
-    BufferClustering(ByteBuffer... values)
+    @VisibleForTesting
+    public BufferClustering(ByteBuffer... values)
     {
         super(Kind.CLUSTERING, values);
     }
+
+    public ClusteringPrefix minimize()
+    {
+        if (!ByteBufferUtil.canMinimize(values))
+            return this;
+        return new BufferClustering(ByteBufferUtil.minimizeBuffers(values));    }
 }

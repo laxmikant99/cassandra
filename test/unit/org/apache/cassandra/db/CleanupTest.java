@@ -28,10 +28,12 @@ import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.collect.Sets;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -39,6 +41,11 @@ import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.locator.PendingRangeMaps;
+import org.apache.cassandra.locator.PropertyFileSnitch;
+import org.apache.cassandra.locator.SimpleStrategy;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.compaction.CompactionManager;
@@ -67,6 +74,9 @@ public class CleanupTest
     public static final String KEYSPACE2 = "CleanupTestMultiDc";
     public static final String CF_INDEXED2 = "Indexed2";
     public static final String CF_STANDARD2 = "Standard2";
+
+    public static final String KEYSPACE3 = "CleanupSkipSSTables";
+    public static final String CF_STANDARD3 = "Standard3";
 
     public static final ByteBuffer COLUMN = ByteBufferUtil.bytes("birthdate");
     public static final ByteBuffer VALUE = ByteBuffer.allocate(8);
@@ -105,18 +115,20 @@ public class CleanupTest
                                     KeyspaceParams.nts("DC1", 1),
                                     SchemaLoader.standardCFMD(KEYSPACE2, CF_STANDARD2),
                                     SchemaLoader.compositeIndexCFMD(KEYSPACE2, CF_INDEXED2, true));
+        SchemaLoader.createKeyspace(KEYSPACE3,
+                                    KeyspaceParams.nts("DC1", 1),
+                                    SchemaLoader.standardCFMD(KEYSPACE3, CF_STANDARD3));
     }
 
-    /*
     @Test
-    public void testCleanup() throws ExecutionException, InterruptedException
+    public void testCleanup() throws ExecutionException, InterruptedException, UnknownHostException
     {
-        StorageService.instance.getTokenMetadata().clearUnsafe();
+        TokenMetadata tmd = StorageService.instance.getTokenMetadata();
+        tmd.clearUnsafe();
+        tmd.updateNormalToken(token(new byte[]{ 50 }), InetAddress.getByName("127.0.0.1"));
 
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
-
-        UnfilteredPartitionIterator iter;
 
         // insert data and verify we get it back w/ range query
         fillCF(cfs, "val", LOOPS);
@@ -124,9 +136,7 @@ public class CleanupTest
         // record max timestamps of the sstables pre-cleanup
         List<Long> expectedMaxTimestamps = getMaxTimestampList(cfs);
 
-        iter = Util.getRangeSlice(cfs);
-        assertEquals(LOOPS, Iterators.size(iter));
-
+        assertEquals(LOOPS, Util.getAll(Util.cmd(cfs).build()).size());
         // with one token in the ring, owned by the local node, cleanup should be a no-op
         CompactionManager.instance.performCleanup(cfs, 2);
 
@@ -134,10 +144,8 @@ public class CleanupTest
         assert expectedMaxTimestamps.equals(getMaxTimestampList(cfs));
 
         // check data is still there
-        iter = Util.getRangeSlice(cfs);
-        assertEquals(LOOPS, Iterators.size(iter));
+        assertEquals(LOOPS, Util.getAll(Util.cmd(cfs).build()).size());
     }
-    */
 
     @Test
     public void testCleanupWithIndexes() throws IOException, ExecutionException, InterruptedException
@@ -251,6 +259,40 @@ public class CleanupTest
         assertTrue(cfs.getLiveSSTables().isEmpty());
     }
 
+    @Test
+    public void testCleanupSkippingSSTables() throws UnknownHostException, ExecutionException, InterruptedException
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE3);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD3);
+        cfs.disableAutoCompaction();
+        for (byte i = 0; i < 100; i++)
+        {
+            new RowUpdateBuilder(cfs.metadata, System.currentTimeMillis(), ByteBuffer.wrap(new byte[] {i}))
+                .clustering(COLUMN)
+                .add("val", VALUE)
+                .build()
+                .applyUnsafe();
+            cfs.forceBlockingFlush();
+        }
+        TokenMetadata tmd = StorageService.instance.getTokenMetadata();
+        tmd.clearUnsafe();
+        tmd.updateHostId(UUID.randomUUID(), InetAddress.getByName("127.0.0.1"));
+        tmd.updateNormalToken(token(new byte[] {50}), InetAddress.getByName("127.0.0.1"));
+        Set<SSTableReader> beforeFirstCleanup = Sets.newHashSet(cfs.getLiveSSTables());
+        // single token - 127.0.0.1 owns everything, cleanup should be noop
+        cfs.forceCleanup(2);
+        assertEquals(beforeFirstCleanup, cfs.getLiveSSTables());
+        tmd.updateNormalToken(token(new byte[] {120}), InetAddress.getByName("127.0.0.2"));
+        cfs.forceCleanup(2);
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+            assertEquals(sstable.first, sstable.last); // single-token sstables
+            assertTrue(sstable.first.getToken().compareTo(token(new byte[]{50})) <= 0);
+            // with single-token sstables they should all either be skipped or dropped:
+            assertTrue(beforeFirstCleanup.contains(sstable));
+        }
+    }
+
 
     @Test
     public void testuserDefinedCleanupWithNewToken() throws ExecutionException, InterruptedException, UnknownHostException
@@ -338,6 +380,43 @@ public class CleanupTest
             assertEquals(testCase.getKey(), CompactionManager.needsCleanup(ssTable, testCase.getValue()));
         }
     }
+
+    @Test
+    public void testCleanupIsAbortedWhenNodeHasPendingRanges() throws ExecutionException, InterruptedException, UnknownHostException
+    {
+        // given
+        StorageService.instance.getTokenMetadata().clearUnsafe();
+
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+
+        fillCF(cfs, "val", LOOPS);
+        assertEquals(LOOPS, Util.getAll(Util.cmd(cfs).build()).size());
+
+        Range<Token> range = range(new BytesToken(new byte[]{0}), new BytesToken(new byte[]{1}));
+        givenPendingRange(cfs, range);
+
+        // when
+        CompactionManager.AllSSTableOpStatus status = CompactionManager.instance.performCleanup(cfs, 2);
+
+        // then
+        assertEquals("cleanup should be aborted", CompactionManager.AllSSTableOpStatus.ABORTED, status);
+    }
+
+    private void givenPendingRange(ColumnFamilyStore cfs, Range<Token> range) throws UnknownHostException
+    {
+        StorageService.instance.getTokenMetadata().calculatePendingRanges(createStrategy(cfs.keyspace.getName()), cfs.keyspace.getName());
+        PendingRangeMaps ranges = StorageService.instance.getTokenMetadata().getPendingRanges(cfs.keyspace.getName());
+        ranges.addPendingRange(range, InetAddress.getByName("127.0.0.1"));
+    }
+
+    private AbstractReplicationStrategy createStrategy(String keyspace)
+    {
+        IEndpointSnitch snitch = new PropertyFileSnitch();
+        DatabaseDescriptor.setEndpointSnitch(snitch);
+        return new SimpleStrategy(keyspace, new TokenMetadata(), DatabaseDescriptor.getEndpointSnitch(), Collections.emptyMap());
+    }
+
     private static BytesToken token(byte ... value)
     {
         return new BytesToken(value);

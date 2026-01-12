@@ -59,7 +59,7 @@ class Cql3ParsingRuleSet(CqlParsingRuleSet):
         # (CQL3 option name, schema_columnfamilies column name (or None if same),
         #  list of known map keys)
         ('compaction', 'compaction_strategy_options',
-            ('class', 'max_threshold', 'tombstone_compaction_interval', 'tombstone_threshold', 'enabled', 'unchecked_tombstone_compaction', 'only_purge_repaired_tombstones')),
+            ('class', 'max_threshold', 'tombstone_compaction_interval', 'tombstone_threshold', 'enabled', 'unchecked_tombstone_compaction', 'only_purge_repaired_tombstones', 'provide_overlapping_tombstones')),
         ('compression', 'compression_parameters',
             ('sstable_compression', 'chunk_length_kb', 'crc_check_chance')),
         ('caching', None,
@@ -359,6 +359,11 @@ completer_for('property', 'propeq')(prop_equals_completer)
 def prop_name_completer(ctxt, cass):
     if working_on_keyspace(ctxt):
         return ks_prop_name_completer(ctxt, cass)
+    elif 'MATERIALIZED' == ctxt.get_binding('wat', '').upper():
+        props = cf_prop_name_completer(ctxt, cass)
+        props.remove('default_time_to_live')
+        props.remove('gc_grace_seconds')
+        return props
     else:
         return cf_prop_name_completer(ctxt, cass)
 
@@ -461,8 +466,7 @@ def ks_prop_val_mapender_completer(ctxt, cass):
 
 
 def cf_prop_name_completer(ctxt, cass):
-    return [c[0] for c in (CqlRuleSet.columnfamily_layout_options +
-                           CqlRuleSet.columnfamily_layout_map_options)]
+    return [c[0] for c in (CqlRuleSet.columnfamily_layout_options + CqlRuleSet.columnfamily_layout_map_options)]
 
 
 def cf_prop_val_completer(ctxt, cass):
@@ -539,6 +543,8 @@ def cf_prop_val_mapval_completer(ctxt, cass):
     if opt == 'compaction':
         if key == 'class':
             return map(escape_value, CqlRuleSet.available_compaction_classes)
+        if key == 'provide_overlapping_tombstones':
+            return [Hint('<NONE|ROW|CELL>')]
         return [Hint('<option_value>')]
     elif opt == 'compression':
         if key == 'sstable_compression':
@@ -677,7 +683,7 @@ def get_ut_layout(ctxt, cass):
 
 
 def working_on_keyspace(ctxt):
-    wat = ctxt.get_binding('wat').upper()
+    wat = ctxt.get_binding('wat', '').upper()
     if wat in ('KEYSPACE', 'SCHEMA'):
         return True
     return False
@@ -864,9 +870,9 @@ syntax_rules += r'''
 def regular_column_names(table_meta):
     if not table_meta or not table_meta.columns:
         return []
-    regular_columns = list(set(table_meta.columns.keys()) -
-                           set([key.name for key in table_meta.partition_key]) -
-                           set([key.name for key in table_meta.clustering_key]))
+    regular_columns = list(set(table_meta.columns.keys())
+                           - set([key.name for key in table_meta.partition_key])
+                           - set([key.name for key in table_meta.clustering_key]))
     return regular_columns
 
 
@@ -1265,9 +1271,16 @@ syntax_rules += r'''
                                ( "USING" <stringLiteral> ( "WITH" "OPTIONS" "=" <mapLiteral> )? )?
                          ;
 
-<createMaterializedViewStatement> ::= "CREATE" "MATERIALIZED" "VIEW" ("IF" "NOT" "EXISTS")? <materializedViewName>?
-                                      "AS" <selectStatement>
-                                      "PRIMARY" "KEY" <pkDef>
+
+<colList> ::= "(" <cident> ( "," <cident> )* ")"
+          ;
+
+<createMaterializedViewStatement> ::= "CREATE" wat="MATERIALIZED" "VIEW" ("IF" "NOT" "EXISTS")? viewname=<materializedViewName>?
+                                      "AS" "SELECT" <selectClause>
+                                      "FROM" cf=<columnFamilyName>
+                                      "WHERE" <cident> "IS" "NOT" "NULL" ( "AND" <cident> "IS" "NOT" "NULL")*
+                                      "PRIMARY" "KEY" (<colList> | ( "(" <colList> ( "," <cident> )* ")" ))
+                                      ( "WITH" <cfamProperty> ( "AND" <cfamProperty> )* )?
                                     ;
 
 <createUserTypeStatement> ::= "CREATE" "TYPE" ( ks=<nonSystemKeyspaceName> dot="." )? typename=<cfOrKsName> "(" newcol=<cident> <storageType>
@@ -1301,6 +1314,7 @@ syntax_rules += r'''
 '''
 
 explain_completion('createIndexStatement', 'indexname', '<new_index_name>')
+explain_completion('createMaterializedViewStatement', 'viewname', '<new_view_name>')
 explain_completion('createUserTypeStatement', 'typename', '<new_type_name>')
 explain_completion('createUserTypeStatement', 'newcol', '<new_field_name>')
 

@@ -24,10 +24,16 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.net.Inet6Address;
 import java.net.InetAddress;
-import java.rmi.registry.LocateRegistry;
+import java.rmi.AccessException;
+import java.rmi.AlreadyBoundException;
+import java.rmi.NoSuchObjectException;
+import java.rmi.NotBoundException;
+import java.rmi.Remote;
+import java.rmi.RemoteException;
 import java.rmi.registry.Registry;
 import java.rmi.server.RMIClientSocketFactory;
 import java.rmi.server.RMIServerSocketFactory;
+import java.rmi.server.UnicastRemoteObject;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
@@ -39,6 +45,7 @@ import javax.rmi.ssl.SslRMIClientSocketFactory;
 import javax.rmi.ssl.SslRMIServerSocketFactory;
 import javax.security.auth.Subject;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -71,10 +78,11 @@ public class JMXServerUtils
         // Configure the RMI client & server socket factories, including SSL config.
         env.putAll(configureJmxSocketFactories(serverAddress, local));
 
-        // configure the RMI registry to use the socket factories we just created
-        Registry registry = LocateRegistry.createRegistry(port,
-                                                          (RMIClientSocketFactory) env.get(RMIConnectorServer.RMI_CLIENT_SOCKET_FACTORY_ATTRIBUTE),
-                                                          (RMIServerSocketFactory) env.get(RMIConnectorServer.RMI_SERVER_SOCKET_FACTORY_ATTRIBUTE));
+        // configure the RMI registry
+        Registry registry = new JmxRegistry(port,
+                                            (RMIClientSocketFactory) env.get(RMIConnectorServer.RMI_CLIENT_SOCKET_FACTORY_ATTRIBUTE),
+                                            (RMIServerSocketFactory) env.get(RMIConnectorServer.RMI_SERVER_SOCKET_FACTORY_ATTRIBUTE),
+                                            "jmxrmi");
 
         // Configure authn, using a JMXAuthenticator which either wraps a set log LoginModules configured
         // via a JAAS configuration entry, or one which delegates to the standard file based authenticator.
@@ -120,7 +128,7 @@ public class JMXServerUtils
             jmxServer.setMBeanServerForwarder(authzProxy);
         jmxServer.start();
 
-        registry.rebind("jmxrmi", server);
+        ((JmxRegistry)registry).setRemoteServerStub(server.toStub());
         logJmxServiceUrl(serverAddress, port);
         return jmxServer;
     }
@@ -158,7 +166,8 @@ public class JMXServerUtils
 
             env.put(JMXConnectorServer.AUTHENTICATOR, new JMXPluggableAuthenticatorWrapper(env));
         }
-
+        env.put("jmx.remote.rmi.server.credential.types",
+            new String[] { String[].class.getName(), String.class.getName() });
         return env;
     }
 
@@ -227,7 +236,8 @@ public class JMXServerUtils
         return env;
     }
 
-    private static void logJmxServiceUrl(InetAddress serverAddress, int port)
+    @VisibleForTesting
+    public static void logJmxServiceUrl(InetAddress serverAddress, int port)
     {
         String urlTemplate = "service:jmx:rmi://%1$s/jndi/rmi://%1$s:%2$d/jmxrmi";
         String hostName;
@@ -270,6 +280,69 @@ public class JMXServerUtils
         {
             JMXPluggableAuthenticator authenticator = new JMXPluggableAuthenticator(env);
             return authenticator.authenticate(credentials);
+        }
+    }
+
+    /*
+     * Better to use the internal API than re-invent the wheel.
+     */
+    @SuppressWarnings("restriction")
+    public static class JmxRegistry extends sun.rmi.registry.RegistryImpl
+    {
+        private final String lookupName;
+        private Remote remoteServerStub;
+
+        public JmxRegistry(final int port,
+                    final RMIClientSocketFactory csf,
+                    RMIServerSocketFactory ssf,
+                    final String lookupName) throws RemoteException {
+            super(port, csf, ssf);
+            this.lookupName = lookupName;
+        }
+
+        @Override
+        public Remote lookup(String s) throws RemoteException, NotBoundException {
+            return lookupName.equals(s) ? remoteServerStub : null;
+        }
+
+        @Override
+        public void bind(String s, Remote remote) throws RemoteException, AlreadyBoundException, AccessException {
+        }
+
+        @Override
+        public void unbind(String s) throws RemoteException, NotBoundException, AccessException {
+        }
+
+        @Override
+        public void rebind(String s, Remote remote) throws RemoteException, AccessException {
+        }
+
+        @Override
+        public String[] list() throws RemoteException {
+            return new String[] {lookupName};
+        }
+
+        public void setRemoteServerStub(Remote remoteServerStub) {
+            this.remoteServerStub = remoteServerStub;
+        }
+
+        /**
+         * Closes the underlying JMX registry by unexporting this instance.
+         * There is no reason to do this except for in-jvm dtests where we need
+         * to stop the registry, so we can start with a clean slate for future cluster
+         * builds, and the superclass never expects to be shut down and therefore doesn't
+         * handle this edge case at all.
+         */
+        @VisibleForTesting
+        public void close() {
+            try
+            {
+                UnicastRemoteObject.unexportObject(this, true);
+            }
+            catch (NoSuchObjectException ignored)
+            {
+                // Ignore if it's already unexported
+            }
         }
     }
 }

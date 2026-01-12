@@ -21,6 +21,7 @@ package org.apache.cassandra.utils.memory;
 import java.lang.ref.PhantomReference;
 import java.lang.ref.ReferenceQueue;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Queue;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -39,6 +40,9 @@ import org.apache.cassandra.metrics.BufferPoolMetrics;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.concurrent.Ref;
+
+import static org.apache.cassandra.utils.ExecutorUtils.awaitTermination;
+import static org.apache.cassandra.utils.ExecutorUtils.shutdownNow;
 
 /**
  * A pool of ByteBuffers that can be recycled.
@@ -181,6 +185,18 @@ public class BufferPool
         globalPool.debug.check();
     }
 
+    /**
+     * Forces to recycle free local chunks back to the global pool.
+     * This is needed because if buffers were freed by a different thread than the one
+     * that allocated them, recycling might not have happened and the local pool may still own some
+     * fully empty chunks.
+     */
+    @VisibleForTesting
+    static void releaseLocal()
+    {
+        localPool.get().release();
+    }
+
     public static long sizeInBytes()
     {
         return globalPool.sizeInBytes();
@@ -188,11 +204,15 @@ public class BufferPool
 
     static final class Debug
     {
-        long recycleRound = 1;
+        volatile long recycleRound = 0;
         final Queue<Chunk> allChunks = new ConcurrentLinkedQueue<>();
         void register(Chunk chunk)
         {
             allChunks.add(chunk);
+        }
+        void acquire(Chunk chunk)
+        {
+            chunk.lastAcquired = recycleRound;
         }
         void recycle(Chunk chunk)
         {
@@ -201,7 +221,8 @@ public class BufferPool
         void check()
         {
             for (Chunk chunk : allChunks)
-                assert chunk.lastRecycled == recycleRound;
+                assert chunk.lastRecycled >= chunk.lastAcquired;
+            // check is called by a single test thread, so no need for atomic here;
             recycleRound++;
         }
     }
@@ -240,6 +261,14 @@ public class BufferPool
 
         /** Return a chunk, the caller will take owership of the parent chunk. */
         public Chunk get()
+        {
+            Chunk chunk = getInternal();
+            if (DEBUG && chunk != null)
+                debug.acquire(chunk);
+            return chunk;
+        }
+
+        private Chunk getInternal()
         {
             while (true)
             {
@@ -466,6 +495,20 @@ public class BufferPool
                 }
             }
         }
+
+        @VisibleForTesting
+        void release()
+        {
+            chunkCount = 0;
+            for (int i = 0; i < chunks.length; i++)
+            {
+                if (chunks[i] != null)
+                {
+                    chunks[i].release();
+                    chunks[i] = null;
+                }
+            }
+        }
     }
 
     private static final class LocalPoolRef extends  PhantomReference<LocalPool>
@@ -558,7 +601,8 @@ public class BufferPool
         // if this is set, it means the chunk may not be recycled because we may still allocate from it;
         // if it has been unset the local pool has finished with it, and it may be recycled
         private volatile LocalPool owner;
-        private long lastRecycled;
+        private volatile long lastAcquired;
+        private volatile long lastRecycled;
         private final Chunk original;
 
         Chunk(Chunk recycle)
@@ -856,9 +900,9 @@ public class BufferPool
     }
 
     @VisibleForTesting
-    public static void shutdownLocalCleaner() throws InterruptedException
+    public static void shutdownLocalCleaner(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
     {
-        EXEC.shutdown();
-        EXEC.awaitTermination(60, TimeUnit.SECONDS);
+        shutdownNow(Arrays.asList(EXEC));
+        awaitTermination(timeout, unit, Arrays.asList(EXEC));
     }
 }

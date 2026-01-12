@@ -239,7 +239,7 @@ class CqlshRunner(ProcRunner):
             cqlsh_bin = 'cqlsh'
             if is_win():
                 cqlsh_bin = 'cqlsh.bat'
-            path = normpath(join(basecase.cqlshdir, cqlsh_bin))
+            path = join(basecase.cqlsh_dir, cqlsh_bin)
         if host is None:
             host = basecase.TEST_HOST
         if port is None:
@@ -270,8 +270,8 @@ class CqlshRunner(ProcRunner):
         else:
             self.output_header = self.read_to_next_prompt()
 
-    def read_to_next_prompt(self):
-        return self.read_until(self.prompt, timeout=10.0, ptty_timeout=3)
+    def read_to_next_prompt(self, timeout=10.0):
+        return self.read_until(self.prompt, timeout=timeout, ptty_timeout=3)
 
     def read_up_to_timeout(self, timeout, blksize=4096):
         output = ProcRunner.read_up_to_timeout(self, timeout, blksize=blksize)

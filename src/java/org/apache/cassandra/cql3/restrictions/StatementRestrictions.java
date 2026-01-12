@@ -152,9 +152,15 @@ public final class StatementRestrictions
          *     allow two IN for the same entity but that doesn't seem very useful)
          *   - The value_alias cannot be restricted in any way (we don't support wide rows with indexed value
          *     in CQL so far)
+         *   - CONTAINS and CONTAINS_KEY cannot be used with UPDATE or DELETE
          */
         for (Relation relation : whereClause.relations)
         {
+            if ((relation.isContains() || relation.isContainsKey()) && (type.isUpdate() || type.isDelete()))
+            {
+                throw invalidRequest("Cannot use %s with %s", type, relation.operator());
+            }
+
             if (relation.operator() == Operator.IS_NOT)
             {
                 if (!forView)
@@ -268,7 +274,7 @@ public final class StatementRestrictions
         }
 
         if (usesSecondaryIndexing)
-            validateSecondaryIndexSelections(selectsOnlyStaticColumns);
+            validateSecondaryIndexSelections();
     }
 
     private void addRestriction(Restriction restriction)
@@ -814,15 +820,10 @@ public final class StatementRestrictions
                         && nonPrimaryKeyRestrictions.hasMultipleContains());
     }
 
-    private void validateSecondaryIndexSelections(boolean selectsOnlyStaticColumns)
+    private void validateSecondaryIndexSelections()
     {
         checkFalse(keyIsInRelation(),
                    "Select on indexed columns and with IN clause for the PRIMARY KEY are not supported");
-        // When the user only select static columns, the intent is that we don't query the whole partition but just
-        // the static parts. But 1) we don't have an easy way to do that with 2i and 2) since we don't support index on
-        // static columns
-        // so far, 2i means that you've restricted a non static column, so the query is somewhat non-sensical.
-        checkFalse(selectsOnlyStaticColumns, "Queries using 2ndary indexes don't support selecting only static columns");
     }
 
     /**

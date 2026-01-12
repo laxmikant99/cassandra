@@ -460,6 +460,7 @@ public class Columns extends AbstractCollection<ColumnDefinition> implements Col
                     // fail deserialization because of that. So we grab a "fake" ColumnDefinition that ensure proper
                     // deserialization. The column will be ignore later on anyway.
                     column = metadata.getDroppedColumnDefinition(name);
+
                     if (column == null)
                         throw new RuntimeException("Unknown column " + UTF8Type.instance.getString(name) + " during deserialization");
                 }

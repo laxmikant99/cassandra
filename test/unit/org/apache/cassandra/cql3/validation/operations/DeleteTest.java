@@ -162,6 +162,27 @@ public class DeleteTest extends CQLTester
                    row("abc", 4, "xyz", "some other value"));
     }
 
+    @Test
+    public void testDeletionWithContainsAndContainsKey() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b frozen<map<int, int>>, c int, primary key (a, b))");
+
+        Object[] row = row(1, map(1, 1, 2, 2), 3);
+        execute("INSERT INTO %s (a, b, c) VALUES (?, ?, ?)", row);
+
+        assertRows(execute("SELECT * FROM %s"), row);
+
+        assertInvalidMessage("Cannot use DELETE with CONTAINS",
+                             "DELETE FROM %s WHERE a=1 AND b CONTAINS 1");
+
+        assertRows(execute("SELECT * FROM %s"), row);
+
+        assertInvalidMessage("Cannot use DELETE with CONTAINS KEY",
+                             "DELETE FROM %s WHERE a=1 AND b CONTAINS KEY 1");
+
+        assertRows(execute("SELECT * FROM %s"), row);
+    }
+
     /**
      * Test deletion by 'composite prefix' (range tombstones)
      * migrated from cql_tests.py:TestCQL.range_tombstones_test()
@@ -489,7 +510,7 @@ public class DeleteTest extends CQLTester
             assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
                                  "DELETE FROM %s WHERE partitionKey > ? ", 0);
 
-            assertInvalidMessage("Cannot use CONTAINS on non-collection column partitionkey",
+            assertInvalidMessage("Cannot use DELETE with CONTAINS",
                                  "DELETE FROM %s WHERE partitionKey CONTAINS ?", 0);
 
             // Non primary key in the where clause
@@ -581,7 +602,7 @@ public class DeleteTest extends CQLTester
             assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
                                  "DELETE FROM %s WHERE partitionKey > ? AND clustering = ?", 0, 1);
 
-            assertInvalidMessage("Cannot use CONTAINS on non-collection column partitionkey",
+            assertInvalidMessage("Cannot use DELETE with CONTAINS",
                                  "DELETE FROM %s WHERE partitionKey CONTAINS ? AND clustering = ?", 0, 1);
 
             // Non primary key in the where clause
@@ -711,7 +732,7 @@ public class DeleteTest extends CQLTester
             assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
                                  "DELETE FROM %s WHERE partitionKey > ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
 
-            assertInvalidMessage("Cannot use CONTAINS on non-collection column partitionkey",
+            assertInvalidMessage("Cannot use DELETE with CONTAINS",
                                  "DELETE FROM %s WHERE partitionKey CONTAINS ? AND clustering_1 = ? AND clustering_2 = ?", 0, 1, 1);
 
             // Non primary key in the where clause
@@ -1124,17 +1145,17 @@ public class DeleteTest extends CQLTester
 
         assertInvalidMessage("Non PRIMARY KEY columns found in where clause: value",
                              "DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND value = ?", 3, 3, 3);
-        assertInvalidMessage("Non PRIMARY KEY columns found in where clause: values",
+        assertInvalidMessage("Cannot use DELETE with CONTAINS",
                              "DELETE FROM %s WHERE partitionKey = ? AND clustering_1 = ? AND values CONTAINS ?", 3, 3, 3);
         assertInvalidMessage("Non PRIMARY KEY columns found in where clause: value",
                              "DELETE FROM %s WHERE partitionKey = ? AND value = ?", 3, 3);
-        assertInvalidMessage("Non PRIMARY KEY columns found in where clause: values",
+        assertInvalidMessage("Cannot use DELETE with CONTAINS",
                              "DELETE FROM %s WHERE partitionKey = ? AND values CONTAINS ?", 3, 3);
         assertInvalidMessage("Some partition key parts are missing: partitionkey",
                              "DELETE FROM %s WHERE clustering_1 = ?", 3);
         assertInvalidMessage("Some partition key parts are missing: partitionkey",
                              "DELETE FROM %s WHERE value = ?", 3);
-        assertInvalidMessage("Some partition key parts are missing: partitionkey",
+        assertInvalidMessage("Cannot use DELETE with CONTAINS",
                              "DELETE FROM %s WHERE values CONTAINS ?", 3);
     }
 
@@ -1506,6 +1527,70 @@ public class DeleteTest extends CQLTester
         execute("DELETE FROM %s WHERE k = ? AND a >= ? AND a < ?", "a", 0, 2);
     }
 
+    /**
+     * Test for CASSANDRA-13917
+    */
+    @Test
+    public void testWithCompactStaticFormat() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int PRIMARY KEY, b int, c int) WITH COMPACT STORAGE");
+        testWithCompactFormat();
+
+        // if column1 is present, hidden column is called column2
+        createTable("CREATE TABLE %s (a int PRIMARY KEY, b int, c int, column1 int) WITH COMPACT STORAGE");
+        assertInvalidMessage("Undefined column name column2",
+                             "DELETE FROM %s WHERE a = 1 AND column2= 1");
+        assertInvalidMessage("Undefined column name column2",
+                             "DELETE FROM %s WHERE a = 1 AND column2 = 1 AND value1 = 1");
+        assertInvalidMessage("Undefined column name column2",
+                             "DELETE column2 FROM %s WHERE a = 1");
+
+        // if value is present, hidden column is called value1
+        createTable("CREATE TABLE %s (a int PRIMARY KEY, b int, c int, value int) WITH COMPACT STORAGE");
+        assertInvalidMessage("Undefined column name value1",
+                             "DELETE FROM %s WHERE a = 1 AND value1 = 1");
+        assertInvalidMessage("Undefined column name value1",
+                             "DELETE FROM %s WHERE a = 1 AND value1 = 1 AND column1 = 1");
+        assertInvalidMessage("Undefined column name value1",
+                             "DELETE value1 FROM %s WHERE a = 1");
+    }
+
+    /**
+     * Test for CASSANDRA-13917
+     */
+    @Test
+    public void testWithCompactNonStaticFormat() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, PRIMARY KEY (a, b)) WITH COMPACT STORAGE");
+        execute("INSERT INTO %s (a, b) VALUES (1, 1)");
+        execute("INSERT INTO %s (a, b) VALUES (2, 1)");
+        assertRows(execute("SELECT a, b FROM %s"),
+                   row(1, 1),
+                   row(2, 1));
+        testWithCompactFormat();
+
+        createTable("CREATE TABLE %s (a int, b int, v int, PRIMARY KEY (a, b)) WITH COMPACT STORAGE");
+        execute("INSERT INTO %s (a, b, v) VALUES (1, 1, 3)");
+        execute("INSERT INTO %s (a, b, v) VALUES (2, 1, 4)");
+        assertRows(execute("SELECT a, b, v FROM %s"),
+                   row(1, 1, 3),
+                   row(2, 1, 4));
+        testWithCompactFormat();
+    }
+
+    private void testWithCompactFormat() throws Throwable
+    {
+        assertInvalidMessage("Undefined column name value",
+                             "DELETE FROM %s WHERE a = 1 AND value = 1");
+        assertInvalidMessage("Undefined column name column1",
+                             "DELETE FROM %s WHERE a = 1 AND column1= 1");
+        assertInvalidMessage("Undefined column name value",
+                             "DELETE FROM %s WHERE a = 1 AND value = 1 AND column1 = 1");
+        assertInvalidMessage("Undefined column name value",
+                             "DELETE value FROM %s WHERE a = 1");
+        assertInvalidMessage("Undefined column name column1",
+                             "DELETE column1 FROM %s WHERE a = 1");
+    }
 
     /**
      * Checks if the memtable is empty or not

@@ -33,8 +33,8 @@ from util import UTC
 
 is_win = platform.system() == 'Windows'
 
-unicode_controlchars_re = re.compile(r'[\x00-\x31\x7f-\xa0]')
-controlchars_re = re.compile(r'[\x00-\x31\x7f-\xff]')
+unicode_controlchars_re = re.compile(r'[\x00-\x1f\x7f-\xa0]')
+controlchars_re = re.compile(r'[\x00-\x1f\x7f-\xff]')
 
 
 def _show_control_chars(match):
@@ -237,12 +237,21 @@ def formatter_for(typname):
     return registrator
 
 
-@formatter_for('bytearray')
+class BlobType(object):
+    def __init__(self, val):
+        self.val = val
+
+    def __str__(self):
+        return str(self.val)
+
+
+@formatter_for('BlobType')
 def format_value_blob(val, colormap, **_):
     bval = '0x' + binascii.hexlify(val)
     return colorme(bval, colormap, 'blob')
 
 
+formatter_for('bytearray')(format_value_blob)
 formatter_for('buffer')(format_value_blob)
 formatter_for('blob')(format_value_blob)
 
@@ -378,7 +387,7 @@ def strftime(time_format, seconds, microseconds=0, timezone=None):
         return '%d' % (seconds * 1000.0)
 
 
-microseconds_regex = re.compile("(.*)(?:\.(\d{1,6}))(.*)")
+microseconds_regex = re.compile(r"(.*)(?:\.(\d{1,6}))(.*)")
 
 
 def round_microseconds(val):

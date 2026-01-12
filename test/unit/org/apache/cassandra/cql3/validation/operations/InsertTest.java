@@ -23,12 +23,51 @@ import org.junit.Test;
 
 import org.apache.cassandra.cql3.Attributes;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.Duration;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.UntypedResultSet.Row;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class InsertTest extends CQLTester
 {
+    @Test
+    public void testInsertZeroDuration() throws Throwable
+    {
+        Duration expectedDuration = Duration.newInstance(0, 0, 0);
+        createTable(KEYSPACE, "CREATE TABLE %s (a INT PRIMARY KEY, b DURATION);");
+        execute("INSERT INTO %s (a, b) VALUES (1, P0Y)");
+        execute("INSERT INTO %s (a, b) VALUES (2, P0M)");
+        execute("INSERT INTO %s (a, b) VALUES (3, P0W)");
+        execute("INSERT INTO %s (a, b) VALUES (4, P0D)");
+        execute("INSERT INTO %s (a, b) VALUES (5, P0Y0M0D)");
+        execute("INSERT INTO %s (a, b) VALUES (6, PT0H)");
+        execute("INSERT INTO %s (a, b) VALUES (7, PT0M)");
+        execute("INSERT INTO %s (a, b) VALUES (8, PT0S)");
+        execute("INSERT INTO %s (a, b) VALUES (9, PT0H0M0S)");
+        execute("INSERT INTO %s (a, b) VALUES (10, P0YT0H)");
+        execute("INSERT INTO %s (a, b) VALUES (11, P0MT0M)");
+        execute("INSERT INTO %s (a, b) VALUES (12, P0DT0S)");
+        execute("INSERT INTO %s (a, b) VALUES (13, P0M0DT0H0S)");
+        execute("INSERT INTO %s (a, b) VALUES (14, P0Y0M0DT0H0M0S)");
+        assertRowsIgnoringOrder(execute("SELECT * FROM %s"),
+                                row(1, expectedDuration),
+                                row(2, expectedDuration),
+                                row(3, expectedDuration),
+                                row(4, expectedDuration),
+                                row(5, expectedDuration),
+                                row(6, expectedDuration),
+                                row(7, expectedDuration),
+                                row(8, expectedDuration),
+                                row(9, expectedDuration),
+                                row(10, expectedDuration),
+                                row(11, expectedDuration),
+                                row(12, expectedDuration),
+                                row(13, expectedDuration),
+                                row(14, expectedDuration));
+        assertInvalidMessage("no viable alternative at input ')' (... b) VALUES (15, [P]))","INSERT INTO %s (a, b) VALUES (15, P)");
+    }
+
     @Test
     public void testInsertWithUnset() throws Throwable
     {
@@ -208,6 +247,73 @@ public class InsertTest extends CQLTester
 
         assertInvalidMessage("Undefined column name valuex",
                              "INSERT INTO %s (partitionKey, clustering_1, clustering_2, valuex) VALUES (0, 0, 0, 2)");
+    }
+
+    /**
+     * Test for CASSANDRA-13917
+     */
+    @Test
+    public void testInsertWithCompactStaticFormat() throws Throwable
+    {
+        testWithCompactTable("CREATE TABLE %s (a int PRIMARY KEY, b int, c int) WITH COMPACT STORAGE");
+
+        // if column1 is present, hidden column is called column2
+        createTable("CREATE TABLE %s (a int PRIMARY KEY, b int, c int, column1 int) WITH COMPACT STORAGE");
+        execute("INSERT INTO %s (a, b, c, column1) VALUES (1, 1, 1, 1)");
+        assertInvalidMessage("Undefined column name column2",
+                             "INSERT INTO %s (a, b, c, column2) VALUES (1, 1, 1, 1)");
+
+        // if value is present, hidden column is called value1
+        createTable("CREATE TABLE %s (a int PRIMARY KEY, b int, c int, value int) WITH COMPACT STORAGE");
+        execute("INSERT INTO %s (a, b, c, value) VALUES (1, 1, 1, 1)");
+        assertInvalidMessage("Undefined column name value1",
+                             "INSERT INTO %s (a, b, c, value1) VALUES (1, 1, 1, 1)");
+    }
+
+    /**
+     * Test for CASSANDRA-13917
+     */
+    @Test
+    public void testInsertWithCompactNonStaticFormat() throws Throwable
+    {
+        testWithCompactTable("CREATE TABLE %s (a int, b int, PRIMARY KEY (a, b)) WITH COMPACT STORAGE");
+        testWithCompactTable("CREATE TABLE %s (a int, b int, v int, PRIMARY KEY (a, b)) WITH COMPACT STORAGE");
+    }
+
+    private void testWithCompactTable(String tableQuery) throws Throwable
+    {
+        createTable(tableQuery);
+
+        // pass correct types to the hidden columns
+        assertInvalidMessage("Undefined column name column1",
+                             "INSERT INTO %s (a, b, column1) VALUES (?, ?, ?)",
+                             1, 1, ByteBufferUtil.bytes('a'));
+        assertInvalidMessage("Undefined column name value",
+                             "INSERT INTO %s (a, b, value) VALUES (?, ?, ?)",
+                             1, 1, ByteBufferUtil.bytes('a'));
+        assertInvalidMessage("Undefined column name column1",
+                             "INSERT INTO %s (a, b, column1, value) VALUES (?, ?, ?, ?)",
+                             1, 1, ByteBufferUtil.bytes('a'), ByteBufferUtil.bytes('b'));
+        assertInvalidMessage("Undefined column name value",
+                             "INSERT INTO %s (a, b, value, column1) VALUES (?, ?, ?, ?)",
+                             1, 1, ByteBufferUtil.bytes('a'), ByteBufferUtil.bytes('b'));
+
+        // pass incorrect types to the hidden columns
+        assertInvalidMessage("Undefined column name value",
+                             "INSERT INTO %s (a, b, value) VALUES (?, ?, ?)",
+                             1, 1, 1);
+        assertInvalidMessage("Undefined column name column1",
+                             "INSERT INTO %s (a, b, column1) VALUES (?, ?, ?)",
+                             1, 1, 1);
+        assertEmpty(execute("SELECT * FROM %s"));
+
+        // pass null to the hidden columns
+        assertInvalidMessage("Undefined column name value",
+                             "INSERT INTO %s (a, b, value) VALUES (?, ?, ?)",
+                             1, 1, null);
+        assertInvalidMessage("Undefined column name column1",
+                             "INSERT INTO %s (a, b, column1) VALUES (?, ?, ?)",
+                             1, 1, null);
     }
 
     @Test

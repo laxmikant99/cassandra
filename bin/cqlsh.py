@@ -74,7 +74,7 @@ except ImportError:
 CQL_LIB_PREFIX = 'cassandra-driver-internal-only-'
 
 CASSANDRA_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..')
-CASSANDRA_CQL_HTML_FALLBACK = 'https://cassandra.apache.org/doc/cql3/CQL-3.2.html'
+CASSANDRA_CQL_HTML_FALLBACK = 'https://cassandra.apache.org/doc/latest/cassandra/cql/cql_singlefile.html'
 
 # default location of local CQL.html
 if os.path.exists(CASSANDRA_PATH + '/doc/cql3/CQL.html'):
@@ -175,6 +175,10 @@ from cqlshlib.formatting import (DEFAULT_DATE_FORMAT, DEFAULT_NANOTIME_FORMAT,
                                  format_by_type, formatter_for)
 from cqlshlib.tracing import print_trace, print_trace_session
 from cqlshlib.util import get_file_encoding_bomsize, trim_if_present
+try:
+    from cqlshlib.serverversion import version as build_version
+except ImportError:
+    build_version = "UNKNOWN"
 
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 9042
@@ -217,8 +221,7 @@ parser.add_option('-k', '--keyspace', help='Authenticate to the given keyspace.'
 parser.add_option("-f", "--file", help="Execute commands from FILE, then exit")
 parser.add_option('--debug', action='store_true',
                   help='Show additional debugging information')
-parser.add_option("--encoding", help="Specify a non-default encoding for output." +
-                  " (Default: %s)" % (UTF8,))
+parser.add_option("--encoding", help="Specify a non-default encoding for output. (Default: %s)" % (UTF8,))
 parser.add_option("--cqlshrc", help="Specify an alternative cqlshrc file location.")
 parser.add_option('--cqlversion', default=None,
                   help='Specify a particular CQL version, '
@@ -532,6 +535,8 @@ class Shell(cmd.Cmd):
         if stdin is None:
             stdin = sys.stdin
 
+        self.check_build_versions()
+
         if tty:
             self.reset_prompt()
             self.report_connection()
@@ -546,6 +551,18 @@ class Shell(cmd.Cmd):
         self.empty_lines = 0
         self.statement_error = False
         self.single_statement = single_statement
+
+    @property
+    def batch_mode(self):
+        return not self.tty
+
+    def check_build_versions(self):
+        baseversion = self.connection_versions['build']
+        extra = baseversion.rfind('-')
+        if extra != -1:
+            baseversion = baseversion[0:extra]
+        if baseversion != build_version:
+            print("WARNING: cqlsh was built against {}, but this server is {}.  All features may not work!".format(build_version, baseversion))
 
     @property
     def is_using_utf8(self):
@@ -622,9 +639,9 @@ class Shell(cmd.Cmd):
         result, = self.session.execute("select * from system.local where key = 'local'")
         vers = {
             'build': result['release_version'],
-            'protocol': result['native_protocol_version'],
             'cql': result['cql_version'],
         }
+        vers['protocol'] = self.conn.protocol_version
         self.connection_versions = vers
 
     def get_keyspace_names(self):
@@ -1075,7 +1092,7 @@ class Shell(cmd.Cmd):
         elif result:
             # CAS INSERT/UPDATE
             self.writeresult("")
-            self.print_static_result(result, self.parse_for_update_meta(statement.query_string))
+            self.print_static_result(result, self.parse_for_update_meta(statement.query_string), with_header=True, tty=self.tty)
         self.flush_output()
         return True, future
 
@@ -1083,20 +1100,30 @@ class Shell(cmd.Cmd):
         self.decoding_errors = []
 
         self.writeresult("")
-        if result.has_more_pages and self.tty:
+
+        def print_all(result, table_meta, tty):
+            # Return the number of rows in total
             num_rows = 0
+            isFirst = True
             while True:
-                if result.current_rows:
+                # Always print for the first page even it is empty
+                if result.current_rows or isFirst:
                     num_rows += len(result.current_rows)
-                    self.print_static_result(result, table_meta)
+                    with_header = isFirst or tty
+                    self.print_static_result(result, table_meta, with_header, tty)
                 if result.has_more_pages:
-                    raw_input("---MORE---")
+                    if self.shunted_query_out is None and tty:
+                        # Only pause when not capturing.
+                        raw_input("---MORE---")
                     result.fetch_next_page()
                 else:
+                    if not tty:
+                        self.writeresult("")
                     break
-        else:
-            num_rows = len(result.current_rows)
-            self.print_static_result(result, table_meta)
+                isFirst = False
+            return num_rows
+
+        num_rows = print_all(result, table_meta, self.tty)
         self.writeresult("(%d rows)" % num_rows)
 
         if self.decoding_errors:
@@ -1106,7 +1133,7 @@ class Shell(cmd.Cmd):
                 self.writeresult('%d more decoding errors suppressed.'
                                  % (len(self.decoding_errors) - 2), color=RED)
 
-    def print_static_result(self, result, table_meta):
+    def print_static_result(self, result, table_meta, with_header, tty):
         if not result.column_names and not table_meta:
             return
 
@@ -1114,7 +1141,7 @@ class Shell(cmd.Cmd):
         formatted_names = [self.myformat_colname(name, table_meta) for name in column_names]
         if not result.current_rows:
             # print header only
-            self.print_formatted_result(formatted_names, None)
+            self.print_formatted_result(formatted_names, None, with_header=True, tty=tty)
             return
 
         cql_types = []
@@ -1128,9 +1155,9 @@ class Shell(cmd.Cmd):
         if self.expand_enabled:
             self.print_formatted_result_vertically(formatted_names, formatted_values)
         else:
-            self.print_formatted_result(formatted_names, formatted_values)
+            self.print_formatted_result(formatted_names, formatted_values, with_header, tty)
 
-    def print_formatted_result(self, formatted_names, formatted_values):
+    def print_formatted_result(self, formatted_names, formatted_values, with_header, tty):
         # determine column widths
         widths = [n.displaywidth for n in formatted_names]
         if formatted_values is not None:
@@ -1139,9 +1166,10 @@ class Shell(cmd.Cmd):
                     widths[num] = max(widths[num], col.displaywidth)
 
         # print header
-        header = ' | '.join(hdr.ljust(w, color=self.color) for (hdr, w) in zip(formatted_names, widths))
-        self.writeresult(' ' + header.rstrip())
-        self.writeresult('-%s-' % '-+-'.join('-' * w for w in widths))
+        if with_header:
+            header = ' | '.join(hdr.ljust(w, color=self.color) for (hdr, w) in zip(formatted_names, widths))
+            self.writeresult(' ' + header.rstrip())
+            self.writeresult('-%s-' % '-+-'.join('-' * w for w in widths))
 
         # stop if there are no rows
         if formatted_values is None:
@@ -1153,7 +1181,8 @@ class Shell(cmd.Cmd):
             line = ' | '.join(col.rjust(w, color=self.color) for (col, w) in zip(row, widths))
             self.writeresult(' ' + line)
 
-        self.writeresult("")
+        if tty:
+            self.writeresult("")
 
     def print_formatted_result_vertically(self, formatted_names, formatted_values):
         max_col_width = max([n.displaywidth for n in formatted_names])
@@ -2390,8 +2419,8 @@ def main(options, hostname, port):
             # we silently ignore and fallback to UTC unless a custom timestamp format (which likely
             # does contain a TZ part) was specified
             if options.time_format != DEFAULT_TIMESTAMP_FORMAT:
-                sys.stderr.write("Warning: custom timestamp format specified in cqlshrc, but local timezone could not be detected.\n" +
-                                 "Either install Python 'tzlocal' module for auto-detection or specify client timezone in your cqlshrc.\n\n")
+                sys.stderr.write("Warning: custom timestamp format specified in cqlshrc, but local timezone could not be detected.\n"
+                                 + "Either install Python 'tzlocal' module for auto-detection or specify client timezone in your cqlshrc.\n\n")
 
     try:
         shell = Shell(hostname,
@@ -2430,8 +2459,8 @@ def main(options, hostname, port):
 
     shell.cmdloop()
     save_history()
-    batch_mode = options.file or options.execute
-    if batch_mode and shell.statement_error:
+
+    if shell.batch_mode and shell.statement_error:
         sys.exit(2)
 
 

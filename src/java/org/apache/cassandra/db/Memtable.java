@@ -56,6 +56,7 @@ import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.HeapPool;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
+import org.apache.cassandra.utils.memory.MemtableCleaner;
 import org.apache.cassandra.utils.memory.MemtablePool;
 import org.apache.cassandra.utils.memory.NativePool;
 import org.apache.cassandra.utils.memory.SlabPool;
@@ -65,25 +66,28 @@ public class Memtable implements Comparable<Memtable>
     private static final Logger logger = LoggerFactory.getLogger(Memtable.class);
 
     public static final MemtablePool MEMORY_POOL = createMemtableAllocatorPool();
+    public static final long NO_MIN_TIMESTAMP = -1;
 
     private static MemtablePool createMemtableAllocatorPool()
     {
         long heapLimit = DatabaseDescriptor.getMemtableHeapSpaceInMb() << 20;
         long offHeapLimit = DatabaseDescriptor.getMemtableOffheapSpaceInMb() << 20;
+        final float cleaningThreshold = DatabaseDescriptor.getMemtableCleanupThreshold();
+        final MemtableCleaner cleaner = ColumnFamilyStore::flushLargestMemtable;
         switch (DatabaseDescriptor.getMemtableAllocationType())
         {
             case unslabbed_heap_buffers:
-                return new HeapPool(heapLimit, DatabaseDescriptor.getMemtableCleanupThreshold(), new ColumnFamilyStore.FlushLargestColumnFamily());
+                return new HeapPool(heapLimit, cleaningThreshold, cleaner);
             case heap_buffers:
-                return new SlabPool(heapLimit, 0, DatabaseDescriptor.getMemtableCleanupThreshold(), new ColumnFamilyStore.FlushLargestColumnFamily());
+                return new SlabPool(heapLimit, 0, cleaningThreshold, cleaner);
             case offheap_buffers:
                 if (!FileUtils.isCleanerAvailable)
                 {
                     throw new IllegalStateException("Could not free direct byte buffer: offheap_buffers is not a safe memtable_allocation_type without this ability, please adjust your config. This feature is only guaranteed to work on an Oracle JVM. Refusing to start.");
                 }
-                return new SlabPool(heapLimit, offHeapLimit, DatabaseDescriptor.getMemtableCleanupThreshold(), new ColumnFamilyStore.FlushLargestColumnFamily());
+                return new SlabPool(heapLimit, offHeapLimit, cleaningThreshold, cleaner);
             case offheap_objects:
-                return new NativePool(heapLimit, offHeapLimit, DatabaseDescriptor.getMemtableCleanupThreshold(), new ColumnFamilyStore.FlushLargestColumnFamily());
+                return new NativePool(heapLimit, offHeapLimit, cleaningThreshold, cleaner);
             default:
                 throw new AssertionError();
         }
@@ -95,7 +99,7 @@ public class Memtable implements Comparable<Memtable>
     private final AtomicLong liveDataSize = new AtomicLong(0);
     private final AtomicLong currentOperations = new AtomicLong(0);
 
-    // the write barrier for directing writes to this memtable during a switch
+    // the write barrier for directing writes to this memtable or the next during a switch
     private volatile OpOrder.Barrier writeBarrier;
     // the precise upper bound of CommitLogPosition owned by this memtable
     private volatile AtomicReference<CommitLogPosition> commitLogUpperBound;
@@ -156,6 +160,16 @@ public class Memtable implements Comparable<Memtable>
         this.cfs = null;
         this.allocator = null;
         this.columnsCollector = new ColumnsCollector(metadata.partitionColumns());
+    }
+
+    @VisibleForTesting
+    public Memtable(CFMetaData metadata, long minTimestamp)
+    {
+        this.initialComparator = metadata.comparator;
+        this.cfs = null;
+        this.allocator = null;
+        this.columnsCollector = new ColumnsCollector(metadata.partitionColumns());
+        this.minTimestamp = minTimestamp;
     }
 
     public MemtableAllocator getAllocator()
@@ -384,9 +398,16 @@ public class Memtable implements Comparable<Memtable>
         return partitions.get(key);
     }
 
+    /**
+     * Returns the minTS if one available, otherwise NO_MIN_TIMESTAMP.
+     *
+     * EncodingStats uses a synthetic epoch TS at 2015. We don't want to leak that (CASSANDRA-18118) so we return NO_MIN_TIMESTAMP instead.
+     *
+     * @return The minTS or NO_MIN_TIMESTAMP if none available
+     */
     public long getMinTimestamp()
     {
-        return minTimestamp;
+        return minTimestamp != EncodingStats.NO_STATS.minTimestamp ? minTimestamp : NO_MIN_TIMESTAMP;
     }
 
     /**
@@ -395,7 +416,7 @@ public class Memtable implements Comparable<Memtable>
     @VisibleForTesting
     public void makeUnflushable()
     {
-        liveDataSize.addAndGet(1L * 1024 * 1024 * 1024 * 1024 * 1024);
+        liveDataSize.addAndGet((long) 1024 * 1024 * 1024 * 1024 * 1024);
     }
 
     class FlushRunnable implements Callable<SSTableMultiWriter>
@@ -469,7 +490,7 @@ public class Memtable implements Comparable<Memtable>
                 if (isBatchLogTable && !partition.partitionLevelDeletion().isLive() && partition.hasRows())
                     continue;
 
-                if (trackContention && partition.usePessimisticLocking())
+                if (trackContention && partition.useLock())
                     heavilyContendedRowCount++;
 
                 if (!partition.isEmpty())

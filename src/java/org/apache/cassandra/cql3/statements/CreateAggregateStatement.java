@@ -80,6 +80,9 @@ public final class CreateAggregateStatement extends SchemaAlteringStatement
 
     public Prepared prepare(ClientState clientState)
     {
+        if (!FunctionName.isNameValid(functionName.name))
+            throw new InvalidRequestException(String.format("Aggregate name '%s' is invalid", functionName.name));
+
         argTypes = new ArrayList<>(argRawTypes.size());
         for (CQL3Type.Raw rawType : argRawTypes)
             argTypes.add(prepareType("arguments", rawType));
@@ -141,7 +144,7 @@ public final class CreateAggregateStatement extends SchemaAlteringStatement
 
     private AbstractType<?> prepareType(String typeName, CQL3Type.Raw rawType)
     {
-        if (rawType.isFrozen())
+        if (!rawType.isTuple() && rawType.isFrozen())
             throw new InvalidRequestException(String.format("The function %s should not be frozen; remove the frozen<> modifier", typeName));
 
         // UDT are not supported non frozen but we do not allow the frozen keyword for argument. So for the moment we

@@ -19,7 +19,6 @@ package org.apache.cassandra.db.rows;
 
 import java.io.IOException;
 
-import com.google.common.collect.Collections2;
 
 import net.nicoulaj.compilecommand.annotations.Inline;
 import org.apache.cassandra.config.ColumnDefinition;
@@ -156,7 +155,7 @@ public class UnfilteredSerializer
         LivenessInfo pkLiveness = row.primaryKeyLivenessInfo();
         Row.Deletion deletion = row.deletion();
         boolean hasComplexDeletion = row.hasComplexDeletion();
-        boolean hasAllColumns = (row.columnCount() == headerColumns.size());
+        boolean hasAllColumns = row.columnCount() == headerColumns.size();
         boolean hasExtendedFlags = hasExtendedFlags(row);
 
         if (isStatic)
@@ -240,7 +239,7 @@ public class UnfilteredSerializer
                 // with. So we use the ColumnDefinition from the "header" which is "current". Also see #11810 for what
                 // happens if we don't do that.
                 ColumnDefinition column = si.next(cd.column());
-                assert column != null : cd.column.toString();
+                assert column != null;
 
                 try
                 {
@@ -337,7 +336,7 @@ public class UnfilteredSerializer
         LivenessInfo pkLiveness = row.primaryKeyLivenessInfo();
         Row.Deletion deletion = row.deletion();
         boolean hasComplexDeletion = row.hasComplexDeletion();
-        boolean hasAllColumns = (row.columnCount() == headerColumns.size());
+        boolean hasAllColumns = row.columnCount() == headerColumns.size();
 
         if (!pkLiveness.isEmpty())
             size += header.timestampSerializedSize(pkLiveness.timestamp());
@@ -356,7 +355,8 @@ public class UnfilteredSerializer
         for (ColumnData data : row)
         {
             ColumnDefinition column = si.next(data.column());
-            assert column != null;
+            if (column == null)
+                continue;
 
             if (data.column.isSimple())
                 size += Cell.serializer.serializedSize((Cell) data, column, pkLiveness, header);
